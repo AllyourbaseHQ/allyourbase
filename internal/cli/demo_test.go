@@ -1,0 +1,707 @@
+package cli
+
+import (
+	"fmt"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"testing/fstest"
+
+	"github.com/allyourbase/ayb/examples"
+	"github.com/allyourbase/ayb/internal/config"
+	"github.com/allyourbase/ayb/internal/vector"
+)
+
+func TestDemoCommandRegistered(t *testing.T) {
+	found := false
+	for _, cmd := range rootCmd.Commands() {
+		if cmd.Name() == "demo" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected 'demo' subcommand to be registered")
+	}
+}
+
+func TestDemoRegistryComplete(t *testing.T) {
+	expected := map[string]int{
+		"kanban":     5173,
+		"live-polls": 5175,
+		"movies":     5177,
+	}
+	for name, port := range expected {
+		demo, ok := demoRegistry[name]
+		if !ok {
+			t.Errorf("demo %q not found in registry", name)
+			continue
+		}
+		if demo.Port != port {
+			t.Errorf("demo %q: expected port %d, got %d", name, port, demo.Port)
+		}
+		if demo.Title == "" {
+			t.Errorf("demo %q: title is empty", name)
+		}
+		if len(demo.TrySteps) == 0 {
+			t.Errorf("demo %q: no try steps", name)
+		}
+	}
+	if len(demoRegistry) != len(expected) {
+		t.Errorf("expected %d demos, got %d", len(expected), len(demoRegistry))
+	}
+}
+
+func TestDemoUnknownName(t *testing.T) {
+	resetJSONFlag()
+	rootCmd.SetArgs([]string{"demo", "nonexistent"})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for unknown demo name")
+	}
+	if !strings.Contains(err.Error(), "unknown demo") {
+		t.Fatalf("expected 'unknown demo' error, got %q", err.Error())
+	}
+}
+
+func TestDemoRequiresName(t *testing.T) {
+	resetJSONFlag()
+	rootCmd.SetArgs([]string{"demo"})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for missing demo name")
+	}
+}
+
+func TestEmbeddedDemoFSContainsSchemas(t *testing.T) {
+	for _, name := range []string{"kanban", "live-polls", "movies"} {
+		data, err := fs.ReadFile(examples.FS, name+"/schema.sql")
+		if err != nil {
+			t.Errorf("reading embedded %s/schema.sql: %v", name, err)
+			continue
+		}
+		if len(data) == 0 {
+			t.Errorf("embedded %s/schema.sql is empty", name)
+		}
+		if !strings.Contains(string(data), "CREATE TABLE") {
+			t.Errorf("embedded %s/schema.sql doesn't contain CREATE TABLE", name)
+		}
+	}
+}
+
+func TestEmbeddedDemoFSContainsMoviesSeed(t *testing.T) {
+	data, err := fs.ReadFile(examples.FS, "movies/seed.sql")
+	if err != nil {
+		t.Fatalf("reading embedded movies/seed.sql: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("embedded movies/seed.sql is empty")
+	}
+	content := string(data)
+	if !strings.Contains(content, "INSERT INTO movies") {
+		t.Fatal("movies/seed.sql should insert into movies table")
+	}
+	if !strings.Contains(content, "ON CONFLICT") {
+		t.Fatal("movies/seed.sql should be upsert-safe")
+	}
+}
+
+func TestEmbeddedDemoFSContainsMoviesEmbeddingsArtifact(t *testing.T) {
+	seed, err := fs.ReadFile(examples.FS, "movies/seed.sql")
+	if err != nil {
+		t.Fatalf("reading embedded movies/seed.sql: %v", err)
+	}
+	artifact, err := fs.ReadFile(examples.FS, "movies/embeddings.json")
+	if err != nil {
+		t.Fatalf("reading embedded movies/embeddings.json: %v", err)
+	}
+	decoded, err := vector.LoadCommittedMoviesEmbeddingArtifact(seed, artifact)
+	if err != nil {
+		t.Fatalf("embedded movies artifact should decode and match embedded seed checksum: %v", err)
+	}
+	if len(decoded.Records) == 0 {
+		t.Fatal("embedded movies artifact has no records")
+	}
+}
+
+func TestEmbeddedMoviesConfigWiresLocalOllamaAI(t *testing.T) {
+	data, err := fs.ReadFile(examples.FS, "movies/ayb.toml")
+	if err != nil {
+		t.Fatalf("reading embedded movies/ayb.toml: %v", err)
+	}
+	cfg, err := config.ParseTOML(data)
+	if err != nil {
+		t.Fatalf("parsing embedded movies/ayb.toml: %v", err)
+	}
+	if cfg.AI.DefaultProvider != "ollama" {
+		t.Fatalf("movies default AI provider = %q, want ollama", cfg.AI.DefaultProvider)
+	}
+	if cfg.AI.EmbeddingProvider != "ollama" {
+		t.Fatalf("movies embedding AI provider = %q, want ollama", cfg.AI.EmbeddingProvider)
+	}
+	ollama, ok := cfg.AI.Providers["ollama"]
+	if !ok {
+		t.Fatal("movies ayb.toml must configure an ollama provider")
+	}
+	if ollama.BaseURL != "http://127.0.0.1:11434" {
+		t.Fatalf("movies ollama base_url = %q, want http://127.0.0.1:11434", ollama.BaseURL)
+	}
+	if ollama.DefaultModel == "" {
+		t.Fatal("movies ollama provider must set a default chat model")
+	}
+	if cfg.AI.EmbeddingModel == "" {
+		t.Fatal("movies ayb.toml must set an embedding model")
+	}
+}
+
+func TestDemoServerStartCommandMoviesUsesEmbeddedConfig(t *testing.T) {
+	originalDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(originalDir); err != nil {
+			t.Fatalf("restore working directory: %v", err)
+		}
+	})
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatalf("change working directory: %v", err)
+	}
+
+	cmd, cleanup, err := demoServerStartCommand("ayb", "movies")
+	if err != nil {
+		t.Fatalf("building movies start command: %v", err)
+	}
+	defer cleanup()
+	if len(cmd.Args) != 4 {
+		t.Fatalf("movies start args = %#v, want ayb start --config <path>", cmd.Args)
+	}
+	if cmd.Args[0] != "ayb" || cmd.Args[1] != "start" || cmd.Args[2] != "--config" {
+		t.Fatalf("movies start args = %#v, want ayb start --config <path>", cmd.Args)
+	}
+	data, err := os.ReadFile(cmd.Args[3])
+	if err != nil {
+		t.Fatalf("reading materialized movies config: %v", err)
+	}
+	cfg, err := config.ParseTOML(data)
+	if err != nil {
+		t.Fatalf("parsing materialized movies config: %v", err)
+	}
+	if cfg.AI.DefaultProvider != "ollama" {
+		t.Fatalf("materialized movies default AI provider = %q, want ollama", cfg.AI.DefaultProvider)
+	}
+	if _, ok := cfg.AI.Providers["ollama"]; !ok {
+		t.Fatal("materialized movies config must include ollama provider")
+	}
+	info, err := os.Stat(cmd.Args[3])
+	if err != nil {
+		t.Fatalf("stat materialized movies config: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("materialized movies config mode = %v, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestDemoServerStartCommandOtherDemosUseDefaultConfigDiscovery(t *testing.T) {
+	cmd, cleanup, err := demoServerStartCommand("ayb", "kanban")
+	if err != nil {
+		t.Fatalf("building kanban start command: %v", err)
+	}
+	defer cleanup()
+	if strings.Join(cmd.Args, " ") != "ayb start" {
+		t.Fatalf("kanban start args = %#v, want ayb start", cmd.Args)
+	}
+}
+
+func TestDemoRegistryNameConsistency(t *testing.T) {
+	for key, demo := range demoRegistry {
+		if key != demo.Name {
+			t.Errorf("registry key %q != demo.Name %q", key, demo.Name)
+		}
+	}
+}
+
+func TestDemoRegistryDescriptionNonEmpty(t *testing.T) {
+	for name, demo := range demoRegistry {
+		if demo.Description == "" {
+			t.Errorf("demo %q: Description is empty", name)
+		}
+	}
+}
+
+func TestDemoValidArgsMatchRegistry(t *testing.T) {
+	validArgs := demoCmd.ValidArgs
+	if len(validArgs) != len(demoRegistry) {
+		t.Fatalf("ValidArgs has %d entries but registry has %d", len(validArgs), len(demoRegistry))
+	}
+	for _, arg := range validArgs {
+		if _, ok := demoRegistry[arg]; !ok {
+			t.Errorf("ValidArg %q not found in demoRegistry", arg)
+		}
+	}
+}
+
+func TestDemoLongLinksSearchGuides(t *testing.T) {
+	expected := []string{
+		"https://allyourbase.io/guide/search",
+		"https://allyourbase.io/guide/migrating-from-algolia",
+	}
+	for _, text := range expected {
+		if !strings.Contains(demoCmd.Long, text) {
+			t.Errorf("demo long help should link %q", text)
+		}
+	}
+}
+
+// TestEmbeddedSchemasUseCorrectRLSKey verifies all demo schemas reference
+// the 'ayb.user_id' session variable that the AYB server actually sets
+// (via SET LOCAL in internal/auth/rls.go). Any reference to 'request.jwt.sub'
+// would silently break RLS policies and RPC functions at runtime.
+func TestEmbeddedSchemasUseCorrectRLSKey(t *testing.T) {
+	for _, name := range []string{"kanban", "live-polls"} {
+		data, err := fs.ReadFile(examples.FS, name+"/schema.sql")
+		if err != nil {
+			t.Fatalf("reading embedded %s/schema.sql: %v", name, err)
+		}
+		content := string(data)
+
+		// Must use the key the server sets
+		if !strings.Contains(content, "ayb.user_id") {
+			t.Errorf("%s/schema.sql: does not reference 'ayb.user_id' — RLS policies won't work", name)
+		}
+
+		// Must NOT use the wrong key
+		if strings.Contains(content, "request.jwt.sub") {
+			t.Errorf("%s/schema.sql: contains 'request.jwt.sub' instead of 'ayb.user_id' — server sets ayb.user_id", name)
+		}
+	}
+}
+
+// TestEmbeddedSchemasHaveRLS verifies every demo schema enables row-level security.
+func TestEmbeddedSchemasHaveRLS(t *testing.T) {
+	for _, name := range []string{"kanban", "live-polls"} {
+		data, err := fs.ReadFile(examples.FS, name+"/schema.sql")
+		if err != nil {
+			t.Fatalf("reading embedded %s/schema.sql: %v", name, err)
+		}
+		content := string(data)
+		if !strings.Contains(content, "ENABLE ROW LEVEL SECURITY") {
+			t.Errorf("%s/schema.sql: does not enable RLS", name)
+		}
+		if !strings.Contains(content, "CREATE POLICY") {
+			t.Errorf("%s/schema.sql: does not create any RLS policies", name)
+		}
+	}
+}
+
+// TestDemoDistContainsIndexHTML verifies each demo's dist/ has an index.html.
+func TestDemoDistContainsIndexHTML(t *testing.T) {
+	for _, name := range []string{"kanban", "live-polls", "movies"} {
+		distFS, err := examples.DemoDist(name)
+		if err != nil {
+			t.Fatalf("DemoDist(%q): %v", name, err)
+		}
+		data, err := fs.ReadFile(distFS, "index.html")
+		if err != nil {
+			t.Errorf("demo %q: dist/index.html not found: %v", name, err)
+			continue
+		}
+		if len(data) == 0 {
+			t.Errorf("demo %q: dist/index.html is empty", name)
+		}
+	}
+}
+
+// TestDemoDistContainsAssets verifies each demo's dist/ has at least one JS and CSS file.
+func TestDemoDistContainsAssets(t *testing.T) {
+	for _, name := range []string{"kanban", "live-polls", "movies"} {
+		distFS, err := examples.DemoDist(name)
+		if err != nil {
+			t.Fatalf("DemoDist(%q): %v", name, err)
+		}
+
+		var hasJS, hasCSS bool
+		fs.WalkDir(distFS, ".", func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if strings.HasSuffix(path, ".js") {
+				hasJS = true
+			}
+			if strings.HasSuffix(path, ".css") {
+				hasCSS = true
+			}
+			return nil
+		})
+
+		if !hasJS {
+			t.Errorf("demo %q: dist/ has no .js files", name)
+		}
+		if !hasCSS {
+			t.Errorf("demo %q: dist/ has no .css files", name)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// demoFileHandler / serveDemoFile unit tests
+//
+// These test the Go HTTP server that replaced Vite dev. The handler serves
+// pre-built static files from an fs.FS and falls back to index.html for
+// client-side routing (SPA behavior).
+// ---------------------------------------------------------------------------
+
+// testDistFS creates an in-memory filesystem mimicking a Vite build output.
+func testDistFS() fstest.MapFS {
+	return fstest.MapFS{
+		"index.html":              {Data: []byte("<html><body>SPA</body></html>")},
+		"assets/index-abc123.js":  {Data: []byte("console.log('app')")},
+		"assets/index-abc123.css": {Data: []byte("body{margin:0}")},
+		"assets/logo.svg":         {Data: []byte("<svg></svg>")},
+		"favicon.ico":             {Data: []byte("icon")},
+	}
+}
+
+func TestDemoFileHandler_RootServesIndexHTML(t *testing.T) {
+	handler := demoFileHandler(testDistFS())
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "SPA") {
+		t.Error("root path did not serve index.html content")
+	}
+}
+
+func TestDemoFileHandler_ExactFileServed(t *testing.T) {
+	handler := demoFileHandler(testDistFS())
+	req := httptest.NewRequest("GET", "/assets/index-abc123.js", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "console.log") {
+		t.Error("JS file content not served")
+	}
+}
+
+func TestDemoFileHandler_SPAFallbackForUnknownPath(t *testing.T) {
+	handler := demoFileHandler(testDistFS())
+	// Client-side route like /polls/123 should fall back to index.html.
+	req := httptest.NewRequest("GET", "/polls/123", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "SPA") {
+		t.Error("SPA fallback did not serve index.html for unknown path")
+	}
+}
+
+func TestDemoFileHandler_CSSServedWithCorrectType(t *testing.T) {
+	handler := demoFileHandler(testDistFS())
+	req := httptest.NewRequest("GET", "/assets/index-abc123.css", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	ct := w.Header().Get("Content-Type")
+	if !strings.Contains(ct, "text/css") {
+		t.Errorf("expected Content-Type to contain text/css, got %q", ct)
+	}
+}
+
+func TestDemoFileHandler_JSServedWithCorrectType(t *testing.T) {
+	handler := demoFileHandler(testDistFS())
+	req := httptest.NewRequest("GET", "/assets/index-abc123.js", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	ct := w.Header().Get("Content-Type")
+	if ct == "" {
+		t.Error("expected Content-Type header for .js file, got empty")
+	}
+}
+
+func TestDemoFileHandler_StaticAssetsCached(t *testing.T) {
+	handler := demoFileHandler(testDistFS())
+	req := httptest.NewRequest("GET", "/assets/index-abc123.js", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	cc := w.Header().Get("Cache-Control")
+	if !strings.Contains(cc, "max-age=") {
+		t.Errorf("expected Cache-Control with max-age for static asset, got %q", cc)
+	}
+}
+
+func TestDemoFileHandler_IndexHTMLNotCached(t *testing.T) {
+	handler := demoFileHandler(testDistFS())
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	cc := w.Header().Get("Cache-Control")
+	if cc != "" {
+		t.Errorf("index.html should not have Cache-Control, got %q", cc)
+	}
+}
+
+func TestServeDemoFile_ReturnsFalseForMissingFile(t *testing.T) {
+	w := httptest.NewRecorder()
+	ok := serveDemoFile(w, testDistFS(), "nonexistent.txt")
+	if ok {
+		t.Error("expected false for missing file")
+	}
+}
+
+func TestServeDemoFile_ReturnsFalseForDirectory(t *testing.T) {
+	w := httptest.NewRecorder()
+	ok := serveDemoFile(w, testDistFS(), "assets")
+	if ok {
+		t.Error("expected false for directory path")
+	}
+}
+
+func TestDemoFileHandler_FaviconServed(t *testing.T) {
+	handler := demoFileHandler(testDistFS())
+	req := httptest.NewRequest("GET", "/favicon.ico", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for favicon, got %d", w.Code)
+	}
+	if w.Body.String() != "icon" {
+		t.Error("favicon content not served correctly")
+	}
+}
+
+// TestDemoFileHandler_WithRealDemoDist verifies the handler works with the
+// actual embedded demo dist/ filesystem, not just the test fixture.
+func TestDemoFileHandler_WithRealDemoDist(t *testing.T) {
+	for _, name := range []string{"kanban", "live-polls", "movies"} {
+		t.Run(name, func(t *testing.T) {
+			distFS, err := examples.DemoDist(name)
+			if err != nil {
+				t.Fatalf("DemoDist(%q): %v", name, err)
+			}
+			handler := demoFileHandler(distFS)
+
+			// Root should serve index.html.
+			req := httptest.NewRequest("GET", "/", nil)
+			w := httptest.NewRecorder()
+			handler(w, req)
+			if w.Code != http.StatusOK {
+				t.Errorf("root: expected 200, got %d", w.Code)
+			}
+			if !strings.Contains(w.Body.String(), "<html") && !strings.Contains(w.Body.String(), "<!doctype") && !strings.Contains(w.Body.String(), "<!DOCTYPE") {
+				t.Errorf("root: response doesn't look like HTML: %s", w.Body.String()[:min(100, w.Body.Len())])
+			}
+
+			// SPA fallback for unknown route.
+			req2 := httptest.NewRequest("GET", "/some/deep/route", nil)
+			w2 := httptest.NewRecorder()
+			handler(w2, req2)
+			if w2.Code != http.StatusOK {
+				t.Errorf("SPA fallback: expected 200, got %d", w2.Code)
+			}
+		})
+	}
+}
+
+// TestEmbeddedSchemasHaveCHECKConstraints verifies every demo schema has CHECK
+// constraints on critical columns to prevent invalid data at the database level.
+// Since there is no manual QA, CHECK constraints are the last line of defense.
+func TestEmbeddedSchemasHaveCHECKConstraints(t *testing.T) {
+	checks := map[string][]string{
+		"live-polls": {"CHECK (length(question) > 0)", "CHECK (length(label) > 0)", "CHECK (position >= 0)"},
+		"kanban":     {"CHECK (length(title) > 0)", "CHECK (position >= 0)"},
+	}
+	for name, expected := range checks {
+		data, err := fs.ReadFile(examples.FS, name+"/schema.sql")
+		if err != nil {
+			t.Fatalf("reading embedded %s/schema.sql: %v", name, err)
+		}
+		content := string(data)
+		for _, check := range expected {
+			if !strings.Contains(content, check) {
+				t.Errorf("%s/schema.sql: missing CHECK constraint %q", name, check)
+			}
+		}
+	}
+}
+
+// TestDemoTryStepsContainCorrectPort verifies that TrySteps URLs match the registered port.
+func TestDemoTryStepsContainCorrectPort(t *testing.T) {
+	for name, demo := range demoRegistry {
+		portStr := fmt.Sprintf("localhost:%d", demo.Port)
+		found := false
+		for _, step := range demo.TrySteps {
+			if strings.Contains(step, portStr) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("demo %q: TrySteps don't reference port %d", name, demo.Port)
+		}
+	}
+}
+
+// TestResolveDemoAdminTokenMissingFile verifies that when the admin-token file
+// doesn't exist, the error message gives actionable instructions (not a cryptic
+// "admin-token not found"). This was a bug fix in session 186.
+func TestResolveDemoAdminTokenMissingFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("AYB_ADMIN_TOKEN", "") // ensure env var doesn't short-circuit
+
+	_, err := resolveDemoAdminToken("http://127.0.0.1:8090")
+	if err == nil {
+		t.Fatal("expected error when admin-token file missing")
+	}
+	msg := err.Error()
+	// Should contain actionable instructions, not just "file not found".
+	if !strings.Contains(msg, "ayb stop") {
+		t.Errorf("error message should suggest 'ayb stop', got: %s", msg)
+	}
+	if !strings.Contains(msg, "ayb demo") {
+		t.Errorf("error message should suggest 'ayb demo', got: %s", msg)
+	}
+}
+
+// TestResolveDemoAdminTokenFromEnv verifies the AYB_ADMIN_TOKEN env var
+// short-circuits file lookup.
+func TestResolveDemoAdminTokenFromEnv(t *testing.T) {
+	t.Setenv("AYB_ADMIN_TOKEN", "test-token-from-env")
+
+	token, err := resolveDemoAdminToken("http://127.0.0.1:8090")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "test-token-from-env" {
+		t.Errorf("expected token from env, got %q", token)
+	}
+}
+
+func TestDemoAuthEnabledReportsEnabledWhenRouteExists(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/auth/me" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "missing token", http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+
+	enabled, err := demoAuthEnabled(ts.URL)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !enabled {
+		t.Fatal("expected auth to be reported as enabled")
+	}
+}
+
+func TestDemoAuthEnabledReportsDisabledWhenRouteMissing(t *testing.T) {
+	ts := httptest.NewServer(http.NotFoundHandler())
+	defer ts.Close()
+
+	enabled, err := demoAuthEnabled(ts.URL)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if enabled {
+		t.Fatal("expected auth to be reported as disabled")
+	}
+}
+
+func TestRequireDemoAuthEnabledReturnsActionableError(t *testing.T) {
+	ts := httptest.NewServer(http.NotFoundHandler())
+	defer ts.Close()
+
+	err := requireDemoAuthEnabled(ts.URL, false)
+	if err == nil {
+		t.Fatal("expected auth-disabled server to be rejected")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "auth disabled") {
+		t.Fatalf("expected auth-disabled guidance, got: %s", msg)
+	}
+	if !strings.Contains(msg, "ayb stop && ayb demo <name>") {
+		t.Fatalf("expected actionable restart instructions, got: %s", msg)
+	}
+}
+
+func TestDemoAdminAuthProxyInjection(t *testing.T) {
+	var gotAdminPath, gotNonAdminPath string
+	var gotAdminAuth, gotNonAdminAuth string
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/admin/") {
+			gotAdminPath = r.URL.Path
+			gotAdminAuth = r.Header.Get("Authorization")
+		} else {
+			gotNonAdminPath = r.URL.Path
+			gotNonAdminAuth = r.Header.Get("Authorization")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	mux := buildDemoMux(testDistFS(), backend.URL, "test-admin-token-123")
+
+	// Admin path should get Authorization injected.
+	req1 := httptest.NewRequest("GET", "/api/admin/movies/search", nil)
+	w1 := httptest.NewRecorder()
+	mux.ServeHTTP(w1, req1)
+	if gotAdminPath != "/api/admin/movies/search" {
+		t.Errorf("admin path not proxied, got %q", gotAdminPath)
+	}
+	if gotAdminAuth != "Bearer test-admin-token-123" {
+		t.Errorf("admin auth not injected, got %q", gotAdminAuth)
+	}
+
+	// Non-admin path should NOT get Authorization injected.
+	req2 := httptest.NewRequest("GET", "/api/auth/me", nil)
+	w2 := httptest.NewRecorder()
+	mux.ServeHTTP(w2, req2)
+	if gotNonAdminPath != "/api/auth/me" {
+		t.Errorf("non-admin path not proxied, got %q", gotNonAdminPath)
+	}
+	if gotNonAdminAuth != "" {
+		t.Errorf("non-admin path should not have auth injected, got %q", gotNonAdminAuth)
+	}
+}
+
+func TestDemoAdminAuthProxyNoTokenNoInjection(t *testing.T) {
+	var gotAuth string
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	mux := buildDemoMux(testDistFS(), backend.URL, "")
+
+	req := httptest.NewRequest("GET", "/api/admin/movies/search", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if gotAuth != "" {
+		t.Errorf("empty admin token should not inject auth, got %q", gotAuth)
+	}
+}

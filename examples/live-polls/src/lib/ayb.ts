@@ -1,0 +1,73 @@
+import { AYBClient } from "@allyourbase/js";
+
+const url = import.meta.env.VITE_AYB_URL ?? "http://localhost:8090";
+const TOKEN_KEY = "ayb_token";
+const REFRESH_TOKEN_KEY = "ayb_refresh_token";
+const ANONYMOUS_BOOTSTRAP_OPTOUT_KEY = "ayb_anonymous_bootstrap_optout";
+export const LIVE_POLLS_BOOTSTRAP_SEEDED_KEY = "ayb_live_polls_bootstrap_seeded";
+export const ayb = new AYBClient(url, {
+  authPersistence: {
+    load: () => {
+      const token = sessionStorage.getItem(TOKEN_KEY);
+      const refreshToken = sessionStorage.getItem(REFRESH_TOKEN_KEY);
+      if (!token || !refreshToken) {
+        return null;
+      }
+      return { token, refreshToken };
+    },
+    save: ({ token, refreshToken }) => {
+      // Keep demo auth tokens scoped to the current browser tab.
+      sessionStorage.setItem(TOKEN_KEY, token);
+      sessionStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
+    },
+    clear: () => {
+      sessionStorage.removeItem(TOKEN_KEY);
+      sessionStorage.removeItem(REFRESH_TOKEN_KEY);
+    },
+  },
+});
+
+const EMAIL_KEY = "ayb_email";
+
+export function persistTokens(email?: string) {
+  if (email) localStorage.setItem(EMAIL_KEY, email);
+}
+
+export function isAnonymousBootstrapEnabled(): boolean {
+  return localStorage.getItem(ANONYMOUS_BOOTSTRAP_OPTOUT_KEY) !== "1";
+}
+
+export function disableAnonymousBootstrap() {
+  localStorage.setItem(ANONYMOUS_BOOTSTRAP_OPTOUT_KEY, "1");
+}
+
+export function clearAnonymousBootstrapOptOut() {
+  localStorage.removeItem(ANONYMOUS_BOOTSTRAP_OPTOUT_KEY);
+}
+
+export function hasLivePollsBootstrapSeeded(): boolean {
+  return sessionStorage.getItem(LIVE_POLLS_BOOTSTRAP_SEEDED_KEY) === "1";
+}
+
+export function markLivePollsBootstrapSeeded() {
+  sessionStorage.setItem(LIVE_POLLS_BOOTSTRAP_SEEDED_KEY, "1");
+}
+
+export function clearLivePollsBootstrapSeeded() {
+  sessionStorage.removeItem(LIVE_POLLS_BOOTSTRAP_SEEDED_KEY);
+}
+
+export function clearPersistedTokens() {
+  sessionStorage.removeItem(TOKEN_KEY);
+  sessionStorage.removeItem(REFRESH_TOKEN_KEY);
+  localStorage.removeItem(EMAIL_KEY);
+  ayb.clearTokens();
+}
+
+export function getPersistedEmail(): string | null {
+  return localStorage.getItem(EMAIL_KEY);
+}
+
+export function isLoggedIn(): boolean {
+  return !!ayb.token;
+}

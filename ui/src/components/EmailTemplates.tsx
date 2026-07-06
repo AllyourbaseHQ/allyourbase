@@ -1,0 +1,525 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type {
+  EmailTemplateEffective,
+  EmailTemplateListResponse,
+  PreviewEmailTemplateResponse,
+} from "../types";
+import {
+  deleteEmailTemplate,
+  getEmailTemplate,
+  listEmailTemplates,
+  previewEmailTemplate,
+  sendTemplateEmail,
+  setEmailTemplateEnabled,
+  upsertEmailTemplate,
+} from "../api";
+import { AlertCircle, Loader2 } from "lucide-react";
+import { cn } from "../lib/utils";
+import { formatDate } from "./shared/format";
+import { useAppToast } from "./ToastProvider";
+
+const PREVIEW_DEBOUNCE_MS = 350;
+const DEFAULT_TEMPLATE_VARIABLE_VALUES: Record<string, string> = {
+  AppName: "Allyourbase",
+  ActionURL: "https://example.com/action",
+};
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
+function defaultVariableValue(name: string): string {
+  return DEFAULT_TEMPLATE_VARIABLE_VALUES[name] ?? "";
+}
+
+function defaultVarsJSON(variables: string[] | undefined): string {
+  if (!variables || variables.length === 0) {
+    return "{}";
+  }
+
+  const vars: Record<string, string> = {};
+  for (const name of variables) {
+    vars[name] = defaultVariableValue(name);
+  }
+  return JSON.stringify(vars, null, 2);
+}
+
+function parseVariablesJSON(input: string): { vars: Record<string, string> | null; error: string | null } {
+  const raw = input.trim();
+  if (raw === "") {
+    return { vars: {}, error: null };
+  }
+
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    return { vars: null, error: "Preview variables must be valid JSON." };
+  }
+
+  if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) {
+    return { vars: null, error: "Preview variables must be a JSON object." };
+  }
+
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(decoded)) {
+    if (typeof v !== "string") {
+      return { vars: null, error: `Variable ${k} must be a string.` };
+    }
+    out[k] = v;
+  }
+
+  return { vars: out, error: null };
+}
+
+export function EmailTemplates() {
+  const [list, setList] = useState<EmailTemplateListResponse | null>(null);
+  const [loadingList, setLoadingList] = useState(true);
+  const [loadingEffective, setLoadingEffective] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [effective, setEffective] = useState<EmailTemplateEffective | null>(null);
+
+  const [subjectTemplate, setSubjectTemplate] = useState("");
+  const [htmlTemplate, setHTMLTemplate] = useState("");
+  const [previewVarsInput, setPreviewVarsInput] = useState("{}");
+  const [previewResult, setPreviewResult] = useState<PreviewEmailTemplateResponse | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [toggling, setToggling] = useState(false);
+  const [sendTo, setSendTo] = useState("");
+  const [sending, setSending] = useState(false);
+  const effectiveLoadSeqRef = useRef(0);
+  const previewRequestSeqRef = useRef(0);
+
+  const { addToast } = useAppToast();
+
+  const selectedItem = useMemo(() => {
+    if (!list || !selectedKey) return null;
+    return list.items.find((item) => item.templateKey === selectedKey) ?? null;
+  }, [list, selectedKey]);
+
+  const isSystemKey = selectedKey?.startsWith("auth.") ?? false;
+  const hasCustomOverride = selectedItem?.source === "custom";
+
+  const loadList = useCallback(async () => {
+    try {
+      setError(null);
+      const res = await listEmailTemplates();
+      setList(res);
+    } catch (e) {
+      setError(getErrorMessage(e, "Failed to load email templates"));
+      setList(null);
+    } finally {
+      setLoadingList(false);
+    }
+  }, []);
+
+  const loadEffective = useCallback(async (key: string) => {
+    const requestSeq = ++effectiveLoadSeqRef.current;
+    setLoadingEffective(true);
+    try {
+      const res = await getEmailTemplate(key);
+      if (effectiveLoadSeqRef.current !== requestSeq) return;
+      setEffective(res);
+      setSubjectTemplate(res.subjectTemplate);
+      setHTMLTemplate(res.htmlTemplate);
+      setPreviewVarsInput(defaultVarsJSON(res.variables));
+      setPreviewResult(null);
+      setPreviewError(null);
+      setSendTo("");
+    } catch (e) {
+      if (effectiveLoadSeqRef.current !== requestSeq) return;
+      setEffective(null);
+      setPreviewResult(null);
+      setPreviewError(getErrorMessage(e, "Failed to load template"));
+    } finally {
+      if (effectiveLoadSeqRef.current !== requestSeq) return;
+      setLoadingEffective(false);
+    }
+  }, []);
+
+  const refreshSelectedTemplate = useCallback(
+    async (key: string) => {
+      await Promise.all([loadList(), loadEffective(key)]);
+    },
+    [loadEffective, loadList],
+  );
+
+  useEffect(() => {
+    loadList();
+  }, [loadList]);
+
+  useEffect(() => {
+    if (!list || list.items.length === 0) {
+      setSelectedKey(null);
+      return;
+    }
+
+    if (!selectedKey) {
+      setSelectedKey(list.items[0].templateKey);
+      return;
+    }
+
+    const stillExists = list.items.some((item) => item.templateKey === selectedKey);
+    if (!stillExists) {
+      setSelectedKey(list.items[0].templateKey);
+    }
+  }, [list, selectedKey]);
+
+  useEffect(() => {
+    if (!selectedKey) return;
+    loadEffective(selectedKey);
+  }, [selectedKey, loadEffective]);
+
+  useEffect(() => {
+    const requestSeq = ++previewRequestSeqRef.current;
+
+    if (!selectedKey || loadingEffective) {
+      setPreviewLoading(false);
+      return;
+    }
+    if (subjectTemplate.trim() === "" || htmlTemplate.trim() === "") {
+      setPreviewLoading(false);
+      return;
+    }
+
+    const parsed = parseVariablesJSON(previewVarsInput);
+    if (parsed.error) {
+      setPreviewError(parsed.error);
+      setPreviewResult(null);
+      setPreviewLoading(false);
+      return;
+    }
+
+    const timer = window.setTimeout(async () => {
+      setPreviewLoading(true);
+      try {
+        const rendered = await previewEmailTemplate(selectedKey, {
+          subjectTemplate,
+          htmlTemplate,
+          variables: parsed.vars ?? {},
+        });
+      if (previewRequestSeqRef.current !== requestSeq) return;
+      setPreviewResult(rendered);
+      setPreviewError(null);
+    } catch (e) {
+      if (previewRequestSeqRef.current !== requestSeq) return;
+      setPreviewResult(null);
+      setPreviewError(getErrorMessage(e, "Preview failed"));
+    } finally {
+      if (previewRequestSeqRef.current !== requestSeq) return;
+      setPreviewLoading(false);
+    }
+  }, PREVIEW_DEBOUNCE_MS);
+
+    return () => window.clearTimeout(timer);
+  }, [selectedKey, loadingEffective, subjectTemplate, htmlTemplate, previewVarsInput]);
+
+  const handleSave = async () => {
+    if (!selectedKey) return;
+    setSaving(true);
+    try {
+      await upsertEmailTemplate(selectedKey, {
+        subjectTemplate,
+        htmlTemplate,
+      });
+      addToast("success", `Saved ${selectedKey}`);
+      await refreshSelectedTemplate(selectedKey);
+    } catch (e) {
+      addToast("error", getErrorMessage(e, "Failed to save template"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleToggle = async () => {
+    if (!selectedKey || !selectedItem || selectedItem.source !== "custom") return;
+    setToggling(true);
+    try {
+      await setEmailTemplateEnabled(selectedKey, !selectedItem.enabled);
+      addToast("success", `${!selectedItem.enabled ? "Enabled" : "Disabled"} ${selectedKey}`);
+      await refreshSelectedTemplate(selectedKey);
+    } catch (e) {
+      addToast("error", getErrorMessage(e, "Failed to update template status"));
+    } finally {
+      setToggling(false);
+    }
+  };
+
+  const handleDeleteOrReset = async () => {
+    if (!selectedKey || !selectedItem || selectedItem.source !== "custom") return;
+
+    setDeleting(true);
+    try {
+      await deleteEmailTemplate(selectedKey);
+      addToast("success", isSystemKey ? `Reset ${selectedKey} to default` : `Deleted ${selectedKey}`);
+      await refreshSelectedTemplate(selectedKey);
+    } catch (e) {
+      addToast("error", getErrorMessage(e, "Failed to delete template"));
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const handleSendTest = async () => {
+    if (!selectedKey) return;
+
+    const recipient = sendTo.trim();
+    if (!recipient) {
+      addToast("error", "Test recipient is required");
+      return;
+    }
+
+    const parsed = parseVariablesJSON(previewVarsInput);
+    if (parsed.error) {
+      addToast("error", parsed.error);
+      return;
+    }
+
+    setSending(true);
+    try {
+      await sendTemplateEmail({
+        templateKey: selectedKey,
+        to: recipient,
+        variables: parsed.vars ?? {},
+      });
+      addToast("success", `Sent test email to ${recipient}`);
+    } catch (e) {
+      addToast("error", getErrorMessage(e, "Failed to send test email"));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  if (loadingList && !list) {
+    return (
+      <div className="flex items-center justify-center h-64 text-gray-500 dark:text-gray-300">
+        <Loader2 className="w-5 h-5 animate-spin mr-2" />
+        Loading email templates...
+      </div>
+    );
+  }
+
+  if (error && !list) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="text-center">
+          <AlertCircle className="w-8 h-8 text-red-400 mx-auto mb-2" />
+          <p className="text-red-600 text-sm">{error}</p>
+          <button
+            onClick={() => {
+              setLoadingList(true);
+              void loadList();
+            }}
+            className="mt-2 text-sm text-blue-600 hover:underline"
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6">
+      <div className="mb-6">
+        <h1 className="text-lg font-semibold">Email Templates</h1>
+        <p className="text-sm text-gray-500 dark:text-gray-300 mt-0.5">
+          Customize built-in auth emails and manage app-specific templates
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-[320px_1fr] gap-6">
+        <section className="border rounded-lg overflow-hidden">
+          <div className="bg-gray-50 dark:bg-gray-800 border-b px-4 py-2 text-xs font-medium text-gray-600 dark:text-gray-300 uppercase tracking-wider">
+            Template Keys
+          </div>
+          {list && list.items.length > 0 ? (
+            <ul>
+              {list.items.map((item) => (
+                <li key={item.templateKey} className="border-b last:border-0">
+                  <button
+                    onClick={() => setSelectedKey(item.templateKey)}
+                    className={cn(
+                      "w-full text-left px-4 py-2.5 hover:bg-gray-50 dark:hover:bg-gray-800 dark:bg-gray-800",
+                      selectedKey === item.templateKey && "bg-gray-100 dark:bg-gray-700",
+                    )}
+                  >
+                    <div className="font-mono text-xs text-gray-800 dark:text-gray-200">{item.templateKey}</div>
+                    <div className="mt-1 flex items-center gap-2 text-[11px] text-gray-600 dark:text-gray-300">
+                      <span
+                        className={cn(
+                          "px-1.5 py-0.5 rounded",
+                          item.source === "custom" ? "bg-blue-100 text-blue-700" : "bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-200",
+                        )}
+                      >
+                        {item.source}
+                      </span>
+                      <span>{item.enabled ? "enabled" : "disabled"}</span>
+                      <span>updated {formatDate(item.updatedAt)}</span>
+                    </div>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="px-4 py-8 text-sm text-gray-500 dark:text-gray-300">No templates found.</div>
+          )}
+        </section>
+
+        <section className="border rounded-lg p-4">
+          {!selectedKey ? (
+            <div className="text-sm text-gray-500 dark:text-gray-300">Select a template key to edit.</div>
+          ) : loadingEffective ? (
+            <div className="flex items-center text-sm text-gray-500 dark:text-gray-300">
+              <Loader2 className="w-4 h-4 animate-spin mr-2" />
+              Loading template...
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-base font-semibold">{selectedKey}</h2>
+                  <p className="text-xs text-gray-500 dark:text-gray-300">
+                    Editing {effective?.source ?? selectedItem?.source ?? "template"} template
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  {hasCustomOverride && selectedItem ? (
+                    <button
+                      onClick={handleToggle}
+                      disabled={toggling}
+                      className="px-3 py-1.5 text-sm border rounded hover:bg-gray-50 dark:hover:bg-gray-800 dark:bg-gray-800 disabled:opacity-60"
+                    >
+                      {selectedItem.enabled ? "Disable Override" : "Enable Override"}
+                    </button>
+                  ) : null}
+
+                  {hasCustomOverride ? (
+                    <button
+                      onClick={handleDeleteOrReset}
+                      disabled={deleting}
+                      className="px-3 py-1.5 text-sm border rounded hover:bg-gray-50 dark:hover:bg-gray-800 dark:bg-gray-800 disabled:opacity-60"
+                    >
+                      {isSystemKey ? "Reset to Default" : "Delete Template"}
+                    </button>
+                  ) : null}
+
+                  <button
+                    onClick={handleSave}
+                    disabled={saving || !selectedKey}
+                    className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-70"
+                  >
+                    Save Template
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label htmlFor="email-template-subject" className="block text-sm text-gray-700 dark:text-gray-200 mb-1">
+                  Subject Template
+                </label>
+                <input
+                  id="email-template-subject"
+                  aria-label="Subject Template"
+                  value={subjectTemplate}
+                  onChange={(e) => setSubjectTemplate(e.target.value)}
+                  className="w-full border rounded px-3 py-2 text-sm font-mono"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="email-template-html" className="block text-sm text-gray-700 dark:text-gray-200 mb-1">
+                  HTML Template
+                </label>
+                <textarea
+                  id="email-template-html"
+                  aria-label="HTML Template"
+                  value={htmlTemplate}
+                  onChange={(e) => setHTMLTemplate(e.target.value)}
+                  rows={8}
+                  className="w-full border rounded px-3 py-2 text-sm font-mono"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="email-template-vars" className="block text-sm text-gray-700 dark:text-gray-200 mb-1">
+                  Preview Variables (JSON)
+                </label>
+                <textarea
+                  id="email-template-vars"
+                  aria-label="Preview Variables (JSON)"
+                  value={previewVarsInput}
+                  onChange={(e) => setPreviewVarsInput(e.target.value)}
+                  rows={5}
+                  className="w-full border rounded px-3 py-2 text-sm font-mono"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-2 items-end">
+                <div>
+                  <label htmlFor="email-template-send-to" className="block text-sm text-gray-700 dark:text-gray-200 mb-1">
+                    Test Recipient
+                  </label>
+                  <input
+                    id="email-template-send-to"
+                    aria-label="Test Recipient"
+                    value={sendTo}
+                    onChange={(e) => setSendTo(e.target.value)}
+                    className="w-full border rounded px-3 py-2 text-sm"
+                    placeholder="user@example.com"
+                  />
+                </div>
+                <button
+                  onClick={handleSendTest}
+                  disabled={sending}
+                  className="px-3 py-2 text-sm border rounded hover:bg-gray-50 dark:hover:bg-gray-800 dark:bg-gray-800 disabled:opacity-60"
+                >
+                  Send Test Email
+                </button>
+              </div>
+
+              <div className="border rounded-lg p-3 bg-gray-50 dark:bg-gray-800 space-y-2">
+                <h3 className="text-sm font-medium">Preview</h3>
+                {previewLoading ? (
+                  <p className="text-xs text-gray-500 dark:text-gray-300">Rendering preview...</p>
+                ) : previewError ? (
+                  <p className="text-xs text-red-600">{previewError}</p>
+                ) : previewResult ? (
+                  <div className="space-y-2 text-xs">
+                    <div>
+                      <p className="font-medium text-gray-700 dark:text-gray-200 mb-1">Subject</p>
+                      <pre className="whitespace-pre-wrap border rounded bg-white dark:bg-gray-800 p-2">{previewResult.subject}</pre>
+                    </div>
+                    <div>
+                      <p className="font-medium text-gray-700 dark:text-gray-200 mb-1">HTML</p>
+                      <pre
+                        data-testid="email-template-preview-html"
+                        tabIndex={0}
+                        className="whitespace-pre-wrap border rounded bg-white dark:bg-gray-800 p-2 max-h-36 overflow-auto"
+                      >
+                        {previewResult.html}
+                      </pre>
+                    </div>
+                    <div>
+                      <p className="font-medium text-gray-700 dark:text-gray-200 mb-1">Plaintext</p>
+                      <pre className="whitespace-pre-wrap border rounded bg-white dark:bg-gray-800 p-2">{previewResult.text}</pre>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-xs text-gray-500 dark:text-gray-300">Preview will appear after template or variables change.</p>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
+      </div>
+
+    </div>
+  );
+}

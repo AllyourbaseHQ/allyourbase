@@ -1,0 +1,16 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+  exclusions:
+    paths:
+      - (^|/)node_modules/.*
+  settings:
+    staticcheck:
+      checks:
+        - "all"
+        - "-QF*" # Disable quickfix suggestions (style preferences, not bugs)
+        - "-ST*" # Disable doc-comment/package-comment style checks for baseline parity.

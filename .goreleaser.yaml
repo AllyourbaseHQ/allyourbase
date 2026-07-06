@@ -1,0 +1,61 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - bash -c "cd ui && npm install --legacy-peer-deps && npm run build"
+    - make demos
+
+builds:
+  - main: ./cmd/ayb
+    binary: ayb
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "ayb_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+
+release:
+  github:
+    owner: AllyourbaseHQ
+    name: allyourbase
+  draft: false
+  prerelease: "{{ contains .Tag \"-\" }}"
+
+scoops:
+  - repository:
+      owner: AllyourbaseHQ
+      name: scoop-bucket
+    skip_upload: auto
+    homepage: "https://github.com/AllyourbaseHQ/allyourbase"
+    description: "Backend-as-a-Service for PostgreSQL. Single binary, one config file."
+    license: MIT

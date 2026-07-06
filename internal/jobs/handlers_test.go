@@ -1,0 +1,952 @@
+//go:build integration
+
+package jobs_test
+
+import (
+	"context"
+	"encoding/json"
+	"io/fs"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/allyourbase/ayb/examples"
+	"github.com/allyourbase/ayb/internal/auth"
+	"github.com/allyourbase/ayb/internal/jobs"
+	"github.com/allyourbase/ayb/internal/migrations"
+	"github.com/allyourbase/ayb/internal/storage"
+	"github.com/allyourbase/ayb/internal/testutil"
+)
+
+// setupHandlerDB sets up a clean DB with migrations and returns the pool.
+func setupHandlerDB(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+
+	_, err := sharedPG.Pool.Exec(ctx, "DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+	testutil.NoError(t, err)
+
+	runner := migrations.NewRunner(sharedPG.Pool, testutil.DiscardLogger())
+	err = runner.Bootstrap(ctx)
+	testutil.NoError(t, err)
+	_, err = runner.Run(ctx)
+	testutil.NoError(t, err)
+}
+
+type resumableCleanupFixture struct {
+	userID       string
+	expiredName  string
+	activeName   string
+	expiredPath  string
+	activePath   string
+	expiredBytes int64
+	activeBytes  int64
+}
+
+func seedResumableCleanupFixture(t *testing.T, ctx context.Context, userEmail, expiredName, activeName string, expiredBytes, activeBytes int64) resumableCleanupFixture {
+	t.Helper()
+
+	fixture := resumableCleanupFixture{
+		expiredName:  expiredName,
+		activeName:   activeName,
+		expiredBytes: expiredBytes,
+		activeBytes:  activeBytes,
+	}
+
+	err := sharedPG.Pool.QueryRow(ctx,
+		`INSERT INTO _ayb_users (email, password_hash) VALUES ($1, 'hash')
+		 RETURNING id`, userEmail).Scan(&fixture.userID)
+	testutil.NoError(t, err)
+
+	tempDir := t.TempDir()
+	fixture.expiredPath = tempDir + "/" + expiredName + ".tmp"
+	fixture.activePath = tempDir + "/" + activeName + ".tmp"
+
+	err = os.WriteFile(fixture.expiredPath, []byte("payload"), 0o600)
+	testutil.NoError(t, err)
+	err = os.WriteFile(fixture.activePath, []byte("payload"), 0o600)
+	testutil.NoError(t, err)
+
+	_, err = sharedPG.Pool.Exec(ctx,
+		`INSERT INTO _ayb_storage_usage (user_id, bytes_used, updated_at) VALUES ($1, $2, NOW())`,
+		fixture.userID, fixture.expiredBytes+fixture.activeBytes)
+	testutil.NoError(t, err)
+
+	_, err = sharedPG.Pool.Exec(ctx,
+		`INSERT INTO _ayb_storage_uploads (bucket, name, path, user_id, total_size, uploaded_size, status, expires_at)
+		 VALUES ('test-bucket', $1, $2, $3, $4, $4, 'active', NOW() - interval '1 hour')`,
+		fixture.expiredName, fixture.expiredPath, fixture.userID, fixture.expiredBytes)
+	testutil.NoError(t, err)
+
+	_, err = sharedPG.Pool.Exec(ctx,
+		`INSERT INTO _ayb_storage_uploads (bucket, name, path, user_id, total_size, uploaded_size, status, expires_at)
+		 VALUES ('test-bucket', $1, $2, $3, $4, $4, 'active', NOW() + interval '1 day')`,
+		fixture.activeName, fixture.activePath, fixture.userID, fixture.activeBytes)
+	testutil.NoError(t, err)
+
+	return fixture
+}
+
+func assertResumableCleanupFixture(t *testing.T, ctx context.Context, fixture resumableCleanupFixture) {
+	t.Helper()
+
+	var expiredCount int
+	err := sharedPG.Pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM _ayb_storage_uploads WHERE bucket = 'test-bucket' AND name = $1`,
+		fixture.expiredName,
+	).Scan(&expiredCount)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 0, expiredCount)
+
+	var activeCount int
+	err = sharedPG.Pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM _ayb_storage_uploads WHERE bucket = 'test-bucket' AND name = $1`,
+		fixture.activeName,
+	).Scan(&activeCount)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, activeCount)
+
+	var bytesUsed int64
+	err = sharedPG.Pool.QueryRow(ctx, `SELECT bytes_used FROM _ayb_storage_usage WHERE user_id = $1`, fixture.userID).Scan(&bytesUsed)
+	testutil.NoError(t, err)
+	testutil.Equal(t, fixture.activeBytes, bytesUsed)
+
+	_, err = os.Stat(fixture.expiredPath)
+	testutil.True(t, os.IsNotExist(err))
+	_, err = os.Stat(fixture.activePath)
+	testutil.NoError(t, err)
+}
+
+func TestStaleSessionCleanupHandler(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+	pool := sharedPG.Pool
+
+	// Seed a user (sessions have FK to users).
+	var userID string
+	err := pool.QueryRow(ctx,
+		`INSERT INTO _ayb_users (email, password_hash) VALUES ('test@example.com', 'hash')
+		 RETURNING id`).Scan(&userID)
+	testutil.NoError(t, err)
+
+	// Insert 2 expired sessions and 1 active.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO _ayb_sessions (user_id, token_hash, expires_at) VALUES
+		 ($1, 'expired1', NOW() - interval '1 hour'),
+		 ($1, 'expired2', NOW() - interval '2 hours'),
+		 ($1, 'active1', NOW() + interval '1 hour')`, userID)
+	testutil.NoError(t, err)
+
+	// Run handler.
+	handler := jobs.StaleSessionCleanupHandler(pool, testutil.DiscardLogger())
+	err = handler(ctx, nil)
+	testutil.NoError(t, err)
+
+	// Verify: only active session remains.
+	var count int
+	err = pool.QueryRow(ctx, `SELECT COUNT(*) FROM _ayb_sessions`).Scan(&count)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, count)
+}
+
+func TestWebhookDeliveryPruneHandler(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+	pool := sharedPG.Pool
+
+	// Create a webhook first (deliveries have FK).
+	var whID string
+	err := pool.QueryRow(ctx,
+		`INSERT INTO _ayb_webhooks (url, secret, events, tables, enabled)
+		 VALUES ('https://example.com/hook', 'secret', '{}', '{}', true)
+		 RETURNING id`).Scan(&whID)
+	testutil.NoError(t, err)
+
+	// Insert old and recent deliveries.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO _ayb_webhook_deliveries (webhook_id, event_action, event_table, success, status_code, attempt, duration_ms, delivered_at)
+		 VALUES
+		 ($1, 'INSERT', 'test', true, 200, 1, 50, NOW() - interval '10 days'),
+		 ($1, 'INSERT', 'test', true, 200, 1, 50, NOW() - interval '8 days'),
+		 ($1, 'INSERT', 'test', true, 200, 1, 50, NOW() - interval '1 day')`, whID)
+	testutil.NoError(t, err)
+
+	// Run with 168h retention (7 days).
+	handler := jobs.WebhookDeliveryPruneHandler(pool, testutil.DiscardLogger())
+	err = handler(ctx, json.RawMessage(`{"retention_hours": 168}`))
+	testutil.NoError(t, err)
+
+	// 2 older than 7 days should be deleted, 1 remains.
+	var count int
+	err = pool.QueryRow(ctx, `SELECT COUNT(*) FROM _ayb_webhook_deliveries`).Scan(&count)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, count)
+}
+
+func TestWebhookDeliveryPruneHandlerDefaultRetention(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+	pool := sharedPG.Pool
+
+	// Empty payload should use default 168h.
+	handler := jobs.WebhookDeliveryPruneHandler(pool, testutil.DiscardLogger())
+	err := handler(ctx, nil)
+	testutil.NoError(t, err) // no deliveries, no error
+}
+
+func TestAuditLogRetentionHandlerDefaultRetention(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+	pool := sharedPG.Pool
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO _ayb_audit_log (table_name, operation, timestamp) VALUES
+		 ('orders', 'INSERT', NOW() - interval '120 days'),
+		 ('orders', 'UPDATE', NOW() - interval '91 days'),
+		 ('orders', 'DELETE', NOW() - interval '89 days'),
+		 ('orders', 'INSERT', NOW() - interval '1 day')`)
+	testutil.NoError(t, err)
+
+	handler := jobs.AuditLogRetentionHandler(pool, 90, testutil.DiscardLogger())
+	err = handler(ctx, nil)
+	testutil.NoError(t, err)
+
+	var count int
+	err = pool.QueryRow(ctx, `SELECT COUNT(*) FROM _ayb_audit_log`).Scan(&count)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 2, count)
+}
+
+func TestAuditLogRetentionHandlerPayloadOverridesDefault(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+	pool := sharedPG.Pool
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO _ayb_audit_log (table_name, operation, timestamp) VALUES
+		 ('orders', 'INSERT', NOW() - interval '40 days'),
+		 ('orders', 'UPDATE', NOW() - interval '20 days')`)
+	testutil.NoError(t, err)
+
+	handler := jobs.AuditLogRetentionHandler(pool, 90, testutil.DiscardLogger())
+	err = handler(ctx, json.RawMessage(`{"retention_days": 30}`))
+	testutil.NoError(t, err)
+
+	var count int
+	err = pool.QueryRow(ctx, `SELECT COUNT(*) FROM _ayb_audit_log`).Scan(&count)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, count)
+}
+
+func TestRequestLogRetentionHandlerDefaultRetention(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+	pool := sharedPG.Pool
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO _ayb_request_logs (method, path, status_code, timestamp) VALUES
+		 ('GET', '/old', 200, NOW() - interval '120 days'),
+		 ('GET', '/young', 200, NOW() - interval '10 days'),
+		 ('POST', '/younger', 201, NOW() - interval '1 day')`)
+	testutil.NoError(t, err)
+
+	handler := jobs.RequestLogRetentionHandler(pool, 90, testutil.DiscardLogger())
+	err = handler(ctx, nil)
+	testutil.NoError(t, err)
+
+	var count int
+	err = pool.QueryRow(ctx, `SELECT COUNT(*) FROM _ayb_request_logs`).Scan(&count)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 2, count)
+}
+
+func TestRequestLogRetentionHandlerPayloadOverridesDefault(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+	pool := sharedPG.Pool
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO _ayb_request_logs (method, path, status_code, timestamp) VALUES
+		 ('GET', '/old', 200, NOW() - interval '40 days'),
+		 ('GET', '/young', 200, NOW() - interval '20 days')`)
+	testutil.NoError(t, err)
+
+	handler := jobs.RequestLogRetentionHandler(pool, 90, testutil.DiscardLogger())
+	err = handler(ctx, json.RawMessage(`{"retention_days": 30}`))
+	testutil.NoError(t, err)
+
+	var count int
+	err = pool.QueryRow(ctx, `SELECT COUNT(*) FROM _ayb_request_logs`).Scan(&count)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, count)
+}
+
+func waitForSingleJobResult(
+	t *testing.T,
+	ctx context.Context,
+	svc *jobs.Service,
+	jobType string,
+	expectedTerminalCount int,
+	timeout time.Duration,
+) (state string, lastError string) {
+	t.Helper()
+	if expectedTerminalCount <= 0 {
+		t.Fatalf("expectedTerminalCount must be positive, got %d", expectedTerminalCount)
+	}
+
+	deadline := time.After(timeout)
+	for {
+		completed, err := svc.List(ctx, "completed", jobType, 10, 0)
+		testutil.NoError(t, err)
+		if len(completed) >= expectedTerminalCount {
+			return "completed", ""
+		}
+
+		failed, err := svc.List(ctx, "failed", jobType, 10, 0)
+		testutil.NoError(t, err)
+		if len(failed) >= expectedTerminalCount {
+			idx := expectedTerminalCount - 1
+			if idx >= len(failed) {
+				idx = len(failed) - 1
+			}
+			if failed[idx].LastError != nil {
+				return "failed", *failed[idx].LastError
+			}
+			return "failed", ""
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for terminal state for job type %q", jobType)
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+func seedJobRunForRetention(t *testing.T, ctx context.Context, jobType string, finishedAt time.Time) {
+	t.Helper()
+
+	var jobID string
+	err := sharedPG.Pool.QueryRow(ctx,
+		`INSERT INTO _ayb_jobs (type, payload, state, run_at, max_attempts)
+		 VALUES ($1, '{}'::jsonb, 'completed', NOW(), 1)
+		 RETURNING id`,
+		jobType,
+	).Scan(&jobID)
+	testutil.NoError(t, err)
+
+	_, err = sharedPG.Pool.Exec(ctx,
+		`INSERT INTO _ayb_job_runs (job_id, attempt, status, started_at, finished_at, duration_ms)
+		 VALUES ($1, 1, 'completed', $2, $3, 60000)`,
+		jobID,
+		finishedAt.Add(-1*time.Minute),
+		finishedAt,
+	)
+	testutil.NoError(t, err)
+}
+
+func countRetentionFixtureRuns(t *testing.T, ctx context.Context) int {
+	t.Helper()
+	var count int
+	err := sharedPG.Pool.QueryRow(ctx,
+		`SELECT COUNT(*)
+		 FROM _ayb_job_runs r
+		 JOIN _ayb_jobs j ON j.id = r.job_id
+		 WHERE j.type LIKE 'job_runs_retention_fixture_%'`,
+	).Scan(&count)
+	testutil.NoError(t, err)
+	return count
+}
+
+func retentionFixtureRunPresent(t *testing.T, ctx context.Context, jobType string) bool {
+	t.Helper()
+	var count int
+	err := sharedPG.Pool.QueryRow(ctx,
+		`SELECT COUNT(*)
+		 FROM _ayb_job_runs r
+		 JOIN _ayb_jobs j ON j.id = r.job_id
+		 WHERE j.type = $1`,
+		jobType,
+	).Scan(&count)
+	testutil.NoError(t, err)
+	return count > 0
+}
+
+func TestRegisterBuiltinHandlers(t *testing.T) {
+	setupHandlerDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	store := jobs.NewStore(sharedPG.Pool)
+	cfg := jobs.DefaultServiceConfig()
+	cfg.PollInterval = 100 * time.Millisecond
+	cfg.LeaseDuration = 5 * time.Second
+	cfg.WorkerConcurrency = 1
+	cfg.SchedulerEnabled = false
+	cfg.ShutdownTimeout = 5 * time.Second
+
+	svc := jobs.NewService(store, testutil.DiscardLogger(), cfg)
+	jobs.RegisterBuiltinHandlers(svc, sharedPG.Pool, nil, testutil.DiscardLogger())
+
+	_, err := svc.Enqueue(ctx, "stale_session_cleanup", nil, jobs.EnqueueOpts{MaxAttempts: 1})
+	testutil.NoError(t, err)
+	_, err = svc.Enqueue(ctx, "job_runs_retention", nil, jobs.EnqueueOpts{MaxAttempts: 1})
+	testutil.NoError(t, err)
+
+	svc.Start(ctx)
+	defer svc.Stop()
+
+	state, lastError := waitForSingleJobResult(t, ctx, svc, "stale_session_cleanup", 1, 5*time.Second)
+	testutil.Equal(t, "completed", state)
+	testutil.Equal(t, "", lastError)
+
+	state, lastError = waitForSingleJobResult(t, ctx, svc, "job_runs_retention", 1, 5*time.Second)
+	testutil.Equal(t, "completed", state)
+	testutil.Equal(t, "", lastError)
+}
+
+func TestJobRunsRetentionThroughService(t *testing.T) {
+	setupHandlerDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	store := jobs.NewStore(sharedPG.Pool)
+	cfg := jobs.DefaultServiceConfig()
+	cfg.PollInterval = 100 * time.Millisecond
+	cfg.LeaseDuration = 5 * time.Second
+	cfg.WorkerConcurrency = 1
+	cfg.SchedulerEnabled = false
+	cfg.ShutdownTimeout = 5 * time.Second
+
+	svc := jobs.NewService(store, testutil.DiscardLogger(), cfg)
+	jobs.RegisterBuiltinHandlers(svc, sharedPG.Pool, nil, testutil.DiscardLogger())
+
+	anchor := time.Now().UTC().Truncate(time.Second)
+	seedJobRunForRetention(t, ctx, "job_runs_retention_fixture_older_than_default", anchor.Add(-120*24*time.Hour))
+	seedJobRunForRetention(t, ctx, "job_runs_retention_fixture_just_inside_default", anchor.Add(-(90*24*time.Hour)+(2*time.Minute)))
+	seedJobRunForRetention(t, ctx, "job_runs_retention_fixture_newer_than_default", anchor.Add(-10*24*time.Hour))
+
+	initialCount := countRetentionFixtureRuns(t, ctx)
+	testutil.Equal(t, 3, initialCount)
+
+	_, err := svc.Enqueue(ctx, "job_runs_retention", nil, jobs.EnqueueOpts{MaxAttempts: 1})
+	testutil.NoError(t, err)
+
+	svc.Start(ctx)
+	defer svc.Stop()
+
+	state, lastError := waitForSingleJobResult(t, ctx, svc, "job_runs_retention", 1, 6*time.Second)
+	testutil.Equal(t, "completed", state)
+	testutil.Equal(t, "", lastError)
+
+	afterDefault := countRetentionFixtureRuns(t, ctx)
+	testutil.Equal(t, 2, afterDefault)
+	testutil.True(t, retentionFixtureRunPresent(t, ctx, "job_runs_retention_fixture_just_inside_default"))
+	testutil.True(t, retentionFixtureRunPresent(t, ctx, "job_runs_retention_fixture_newer_than_default"))
+	testutil.False(t, retentionFixtureRunPresent(t, ctx, "job_runs_retention_fixture_older_than_default"))
+
+	_, err = svc.Enqueue(ctx, "job_runs_retention", json.RawMessage(`{"retention_days":30}`), jobs.EnqueueOpts{MaxAttempts: 1})
+	testutil.NoError(t, err)
+
+	state, lastError = waitForSingleJobResult(t, ctx, svc, "job_runs_retention", 2, 6*time.Second)
+	testutil.Equal(t, "completed", state)
+	testutil.Equal(t, "", lastError)
+
+	afterOverride := countRetentionFixtureRuns(t, ctx)
+	testutil.Equal(t, 1, afterOverride)
+	testutil.True(t, retentionFixtureRunPresent(t, ctx, "job_runs_retention_fixture_newer_than_default"))
+	testutil.False(t, retentionFixtureRunPresent(t, ctx, "job_runs_retention_fixture_just_inside_default"))
+	testutil.False(t, retentionFixtureRunPresent(t, ctx, "job_runs_retention_fixture_older_than_default"))
+}
+
+func TestExpiredOAuthCleanupHandler(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+	pool := sharedPG.Pool
+
+	// Seed user + OAuth client (required by FKs).
+	var userID string
+	err := pool.QueryRow(ctx,
+		`INSERT INTO _ayb_users (email, password_hash) VALUES ('oauth@example.com', 'hash')
+		 RETURNING id`).Scan(&userID)
+	testutil.NoError(t, err)
+
+	// Need an app first (oauth_clients references apps, apps require owner_user_id).
+	var appID string
+	err = pool.QueryRow(ctx,
+		`INSERT INTO _ayb_apps (name, description, owner_user_id) VALUES ('test-app', 'test', $1)
+		 RETURNING id`, userID).Scan(&appID)
+	testutil.NoError(t, err)
+
+	// client_id must match ^ayb_cid_[0-9a-f]{48}$ per CHECK constraint.
+	testClientID := "ayb_cid_aabbccdd00112233445566778899aabbccdd001122334455"
+	// client_secret_hash must be 64 hex chars (SHA-256) for confidential client type.
+	testSecretHash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	_, err = pool.Exec(ctx,
+		`INSERT INTO _ayb_oauth_clients (client_id, client_secret_hash, app_id, name, redirect_uris, scopes, client_type)
+		 VALUES ($2, $3, $1, 'test-client', '{"https://example.com/cb"}', '{"readonly"}', 'confidential')`,
+		appID, testClientID, testSecretHash)
+	testutil.NoError(t, err)
+
+	// Insert expired token (> 1 day old).
+	_, err = pool.Exec(ctx,
+		`INSERT INTO _ayb_oauth_tokens (token_hash, token_type, client_id, user_id, scope, grant_id, expires_at)
+		 VALUES ('expired_tok', 'access', $2, $1, 'readonly', gen_random_uuid(), NOW() - interval '2 days')`, userID, testClientID)
+	testutil.NoError(t, err)
+
+	// Insert active token.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO _ayb_oauth_tokens (token_hash, token_type, client_id, user_id, scope, grant_id, expires_at)
+		 VALUES ('active_tok', 'access', $2, $1, 'readonly', gen_random_uuid(), NOW() + interval '1 hour')`, userID, testClientID)
+	testutil.NoError(t, err)
+
+	// Insert expired auth code.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO _ayb_oauth_authorization_codes (code_hash, client_id, user_id, redirect_uri, scope, code_challenge, state, expires_at)
+		 VALUES ('expired_code', $2, $1, 'https://example.com/cb', 'readonly', 'challenge', 'state1', NOW() - interval '1 hour')`, userID, testClientID)
+	testutil.NoError(t, err)
+
+	// Insert active auth code.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO _ayb_oauth_authorization_codes (code_hash, client_id, user_id, redirect_uri, scope, code_challenge, state, expires_at)
+		 VALUES ('active_code', $2, $1, 'https://example.com/cb', 'readonly', 'challenge', 'state2', NOW() + interval '10 minutes')`, userID, testClientID)
+	testutil.NoError(t, err)
+
+	handler := jobs.ExpiredOAuthCleanupHandler(pool, testutil.DiscardLogger())
+	err = handler(ctx, nil)
+	testutil.NoError(t, err)
+
+	// Expired token deleted, active remains.
+	var tokenCount int
+	err = pool.QueryRow(ctx, `SELECT COUNT(*) FROM _ayb_oauth_tokens`).Scan(&tokenCount)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, tokenCount)
+
+	// Expired code deleted, active remains.
+	var codeCount int
+	err = pool.QueryRow(ctx, `SELECT COUNT(*) FROM _ayb_oauth_authorization_codes`).Scan(&codeCount)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, codeCount)
+}
+
+func TestExpiredAuthCleanupHandler(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+	pool := sharedPG.Pool
+
+	// Seed user (password resets have FK).
+	var userID string
+	err := pool.QueryRow(ctx,
+		`INSERT INTO _ayb_users (email, password_hash) VALUES ('auth@example.com', 'hash')
+		 RETURNING id`).Scan(&userID)
+	testutil.NoError(t, err)
+
+	// Insert expired and active magic links.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO _ayb_magic_links (email, token_hash, expires_at) VALUES
+		 ('auth@example.com', 'expired_link', NOW() - interval '1 hour'),
+		 ('auth@example.com', 'active_link', NOW() + interval '1 hour')`)
+	testutil.NoError(t, err)
+
+	// Insert expired and active password resets.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO _ayb_password_resets (user_id, token_hash, expires_at) VALUES
+		 ($1, 'expired_reset', NOW() - interval '1 hour'),
+		 ($1, 'active_reset', NOW() + interval '1 hour')`, userID)
+	testutil.NoError(t, err)
+
+	handler := jobs.ExpiredAuthCleanupHandler(pool, testutil.DiscardLogger())
+	err = handler(ctx, nil)
+	testutil.NoError(t, err)
+
+	// Only active magic link remains.
+	var linkCount int
+	err = pool.QueryRow(ctx, `SELECT COUNT(*) FROM _ayb_magic_links`).Scan(&linkCount)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, linkCount)
+
+	// Only active password reset remains.
+	var resetCount int
+	err = pool.QueryRow(ctx, `SELECT COUNT(*) FROM _ayb_password_resets`).Scan(&resetCount)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, resetCount)
+}
+
+func TestMatviewRefreshHandlerIntegration(t *testing.T) {
+	setupHandlerDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool := sharedPG.Pool
+
+	// Create a materialized view to refresh.
+	_, err := pool.Exec(ctx, `CREATE TABLE public.mv_scores (id serial PRIMARY KEY, score int)`)
+	testutil.NoError(t, err)
+	_, err = pool.Exec(ctx, `INSERT INTO public.mv_scores (score) VALUES (10), (20)`)
+	testutil.NoError(t, err)
+	_, err = pool.Exec(ctx, `CREATE MATERIALIZED VIEW public.mv_totals AS SELECT sum(score) AS total FROM public.mv_scores`)
+	testutil.NoError(t, err)
+
+	// Set up the jobs service with the matview refresh handler.
+	store := jobs.NewStore(pool)
+	cfg := jobs.DefaultServiceConfig()
+	cfg.PollInterval = 100 * time.Millisecond
+	cfg.LeaseDuration = 5 * time.Second
+	cfg.WorkerConcurrency = 2
+	cfg.SchedulerTick = 200 * time.Millisecond
+
+	svc := jobs.NewService(store, testutil.DiscardLogger(), cfg)
+	jobs.RegisterBuiltinHandlers(svc, pool, nil, testutil.DiscardLogger())
+
+	// Enqueue a matview refresh job.
+	_, err = svc.Enqueue(ctx, "materialized_view_refresh",
+		json.RawMessage(`{"schema":"public","view_name":"mv_totals"}`),
+		jobs.EnqueueOpts{})
+	testutil.NoError(t, err)
+
+	svc.Start(ctx)
+	defer svc.Stop()
+
+	// Wait for job to complete.
+	deadline := time.After(10 * time.Second)
+	for {
+		completed, err := svc.List(ctx, "completed", "materialized_view_refresh", 10, 0)
+		testutil.NoError(t, err)
+		if len(completed) == 1 {
+			break
+		}
+		// Also check for failed jobs to avoid hanging on errors.
+		failed, err := svc.List(ctx, "failed", "materialized_view_refresh", 10, 0)
+		testutil.NoError(t, err)
+		if len(failed) > 0 {
+			t.Fatalf("matview refresh job failed: %v", failed[0].LastError)
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for matview refresh job")
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	// Insert more data, enqueue another refresh, verify data is actually refreshed.
+	_, err = pool.Exec(ctx, `INSERT INTO public.mv_scores (score) VALUES (30)`)
+	testutil.NoError(t, err)
+
+	_, err = svc.Enqueue(ctx, "materialized_view_refresh",
+		json.RawMessage(`{"schema":"public","view_name":"mv_totals"}`),
+		jobs.EnqueueOpts{})
+	testutil.NoError(t, err)
+
+	deadline2 := time.After(10 * time.Second)
+	for {
+		completed, err := svc.List(ctx, "completed", "materialized_view_refresh", 10, 0)
+		testutil.NoError(t, err)
+		if len(completed) == 2 {
+			break
+		}
+		select {
+		case <-deadline2:
+			t.Fatal("timed out waiting for second matview refresh job")
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	var total int
+	err = pool.QueryRow(ctx, `SELECT total FROM public.mv_totals`).Scan(&total)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 60, total) // 10+20+30
+}
+
+func TestMoviesReembedHandlerRepairsDriftedEmbeddings(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+	pool := sharedPG.Pool
+
+	schemaSQL, err := fs.ReadFile(examples.FS, "movies/schema.sql")
+	testutil.NoError(t, err)
+	_, err = pool.Exec(ctx, string(schemaSQL))
+	testutil.NoError(t, err)
+	seedSQL, err := fs.ReadFile(examples.FS, "movies/seed.sql")
+	testutil.NoError(t, err)
+	_, err = pool.Exec(ctx, string(seedSQL))
+	testutil.NoError(t, err)
+
+	frozen := time.Date(2001, time.January, 1, 0, 0, 0, 0, time.UTC)
+	_, err = pool.Exec(ctx, `UPDATE movies SET embedding='[9,9,9]', updated_at=$1 WHERE slug='inception'`, frozen)
+	testutil.NoError(t, err)
+	_, err = pool.Exec(ctx, `UPDATE movies SET updated_at=$1 WHERE slug='arrival'`, frozen)
+	testutil.NoError(t, err)
+
+	handler := jobs.MoviesReembedHandler(pool, testutil.DiscardLogger())
+	err = handler(ctx, nil)
+	testutil.NoError(t, err)
+
+	var inceptionEmbedding string
+	var inceptionUpdatedAt time.Time
+	err = pool.QueryRow(ctx, `SELECT embedding::text, updated_at FROM movies WHERE slug='inception'`).Scan(&inceptionEmbedding, &inceptionUpdatedAt)
+	testutil.NoError(t, err)
+	testutil.Equal(t, "[0.91,0.12,0.18]", inceptionEmbedding)
+	testutil.True(t, inceptionUpdatedAt.After(frozen))
+
+	var arrivalEmbedding string
+	var arrivalUpdatedAt time.Time
+	err = pool.QueryRow(ctx, `SELECT embedding::text, updated_at FROM movies WHERE slug='arrival'`).Scan(&arrivalEmbedding, &arrivalUpdatedAt)
+	testutil.NoError(t, err)
+	testutil.Equal(t, "[0.31,0.88,0.22]", arrivalEmbedding)
+	testutil.True(t, arrivalUpdatedAt.Equal(frozen))
+}
+
+func TestMoviesReembedHandlerSkipsWhenMoviesSchemaMissing(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+
+	handler := jobs.MoviesReembedHandler(sharedPG.Pool, testutil.DiscardLogger())
+	err := handler(ctx, nil)
+	testutil.NoError(t, err)
+}
+
+func TestMoviesReembedHandlerSkipsWhenMoviesTableIsNotDemoSchema(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+	pool := sharedPG.Pool
+
+	_, err := pool.Exec(ctx, `
+		CREATE TABLE public.movies (
+			slug text PRIMARY KEY,
+			title text NOT NULL
+		)`)
+	testutil.NoError(t, err)
+	_, err = pool.Exec(ctx, `INSERT INTO public.movies (slug, title) VALUES ('custom-entry', 'Custom Entry')`)
+	testutil.NoError(t, err)
+
+	handler := jobs.MoviesReembedHandler(pool, testutil.DiscardLogger())
+	err = handler(ctx, nil)
+	testutil.NoError(t, err)
+
+	var count int
+	err = pool.QueryRow(ctx, `SELECT COUNT(*) FROM public.movies`).Scan(&count)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, count)
+}
+
+func TestMoviesReembedHandlerSkipsExactSchemaWhenRowsAreNotDemoCorpus(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+	pool := sharedPG.Pool
+
+	schemaSQL, err := fs.ReadFile(examples.FS, "movies/schema.sql")
+	testutil.NoError(t, err)
+	_, err = pool.Exec(ctx, string(schemaSQL))
+	testutil.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO movies (id, slug, title, overview, release_year, genres, embedding)
+		VALUES (
+			'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+			'inception',
+			'Custom Inception',
+			'User-owned corpus entry that should not be rewritten by the demo job.',
+			2025,
+			ARRAY['custom'],
+			'[9,9,9]'
+		)`)
+	testutil.NoError(t, err)
+
+	handler := jobs.MoviesReembedHandler(pool, testutil.DiscardLogger())
+	err = handler(ctx, nil)
+	testutil.NoError(t, err)
+
+	var id, title, embedding string
+	err = pool.QueryRow(ctx, `SELECT id::text, title, embedding::text FROM movies WHERE slug='inception'`).Scan(&id, &title, &embedding)
+	testutil.NoError(t, err)
+	testutil.Equal(t, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", id)
+	testutil.Equal(t, "Custom Inception", title)
+	testutil.Equal(t, "[9,9,9]", embedding)
+}
+
+func TestHandlersRunThroughService(t *testing.T) {
+	setupHandlerDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	store := jobs.NewStore(sharedPG.Pool)
+	cfg := jobs.DefaultServiceConfig()
+	cfg.PollInterval = 100 * time.Millisecond
+	cfg.LeaseDuration = 5 * time.Second
+	cfg.WorkerConcurrency = 2
+	cfg.SchedulerTick = 200 * time.Millisecond
+
+	storageSvc := storage.NewService(sharedPG.Pool, nil, "", testutil.DiscardLogger(), 0)
+	svc := jobs.NewService(store, testutil.DiscardLogger(), cfg)
+	jobs.RegisterBuiltinHandlers(svc, sharedPG.Pool, storageSvc, testutil.DiscardLogger())
+
+	fixture := seedResumableCleanupFixture(
+		t,
+		ctx,
+		"svc@example.com",
+		"expired-through-service.txt",
+		"active-through-service.txt",
+		120,
+		180,
+	)
+
+	// Insert expired session.
+	_, err := sharedPG.Pool.Exec(ctx,
+		`INSERT INTO _ayb_sessions (user_id, token_hash, expires_at)
+			 VALUES ($1, 'exp_sess', NOW() - interval '1 hour')`, fixture.userID)
+	testutil.NoError(t, err)
+
+	// Enqueue the cleanup jobs.
+	_, err = svc.Enqueue(ctx, "stale_session_cleanup", nil, jobs.EnqueueOpts{})
+	testutil.NoError(t, err)
+	_, err = svc.Enqueue(ctx, "expired_resumable_upload_cleanup", nil, jobs.EnqueueOpts{})
+	testutil.NoError(t, err)
+
+	svc.Start(ctx)
+	defer svc.Stop()
+
+	// Wait for jobs to complete.
+	deadline := time.After(5 * time.Second)
+	for {
+		staleCompleted, err := svc.List(ctx, "completed", "stale_session_cleanup", 10, 0)
+		testutil.NoError(t, err)
+		resumableCompleted, err := svc.List(ctx, "completed", "expired_resumable_upload_cleanup", 10, 0)
+		testutil.NoError(t, err)
+		if len(staleCompleted) == 1 && len(resumableCompleted) == 1 {
+			break
+		}
+
+		staleFailed, err := svc.List(ctx, "failed", "stale_session_cleanup", 10, 0)
+		testutil.NoError(t, err)
+		if len(staleFailed) > 0 {
+			t.Fatalf("stale_session_cleanup failed: %v", staleFailed[0].LastError)
+		}
+		resumableFailed, err := svc.List(ctx, "failed", "expired_resumable_upload_cleanup", 10, 0)
+		testutil.NoError(t, err)
+		if len(resumableFailed) > 0 {
+			t.Fatalf("expired_resumable_upload_cleanup failed: %v", resumableFailed[0].LastError)
+		}
+
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for handler execution")
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	// Verify expired session was cleaned up.
+	var count int
+	err = sharedPG.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM _ayb_sessions`).Scan(&count)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 0, count)
+
+	assertResumableCleanupFixture(t, ctx, fixture)
+}
+
+func TestResumableUploadCleanupHandler(t *testing.T) {
+	setupHandlerDB(t)
+	ctx := context.Background()
+	pool := sharedPG.Pool
+	storageSvc := storage.NewService(pool, nil, "", testutil.DiscardLogger(), 0)
+
+	fixture := seedResumableCleanupFixture(
+		t,
+		ctx,
+		"resumable@example.com",
+		"expired.txt",
+		"active.txt",
+		100,
+		200,
+	)
+
+	handler := jobs.ResumableUploadCleanupHandler(storageSvc, testutil.DiscardLogger())
+	err := handler(ctx, nil)
+	testutil.NoError(t, err)
+
+	var uploadCount int
+	err = pool.QueryRow(ctx, `SELECT COUNT(*) FROM _ayb_storage_uploads WHERE bucket = 'test-bucket'`).Scan(&uploadCount)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, uploadCount)
+
+	assertResumableCleanupFixture(t, ctx, fixture)
+}
+
+func TestResumableUploadCleanupHandlerRequiresStorageService(t *testing.T) {
+	handler := jobs.ResumableUploadCleanupHandler(nil, testutil.DiscardLogger())
+	err := handler(context.Background(), nil)
+	testutil.Error(t, err)
+	testutil.Contains(t, err.Error(), "storage service is nil")
+}
+
+type fakeProviderTokenRefreshService struct {
+	calls  int
+	window time.Duration
+	err    error
+}
+
+func (f *fakeProviderTokenRefreshService) RefreshExpiringProviderTokens(_ context.Context, window time.Duration) error {
+	f.calls++
+	f.window = window
+	return f.err
+}
+
+func TestProviderTokenRefreshJobHandler(t *testing.T) {
+	svc := &fakeProviderTokenRefreshService{}
+	handler := jobs.ProviderTokenRefreshJobHandler(svc)
+
+	err := handler(context.Background(), nil)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, svc.calls)
+	testutil.Equal(t, 10*time.Minute, svc.window)
+
+	svc = &fakeProviderTokenRefreshService{}
+	handler = jobs.ProviderTokenRefreshJobHandler(svc)
+	err = handler(context.Background(), json.RawMessage(`{"window_seconds": 120}`))
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, svc.calls)
+	testutil.Equal(t, 120*time.Second, svc.window)
+}
+
+type fakeAnonymousUserCleaner struct {
+	calls int
+	ttl   time.Duration
+	count int64
+	err   error
+}
+
+func (f *fakeAnonymousUserCleaner) CleanupAnonymousUsers(_ context.Context, ttl time.Duration) (int64, error) {
+	f.calls++
+	f.ttl = ttl
+	return f.count, f.err
+}
+
+func TestAnonymousUserCleanupHandler(t *testing.T) {
+	cleaner := &fakeAnonymousUserCleaner{count: 7}
+	handler := jobs.AnonymousUserCleanupHandler(cleaner, testutil.DiscardLogger())
+
+	err := handler(context.Background(), nil)
+	testutil.NoError(t, err)
+	testutil.Equal(t, 1, cleaner.calls)
+	testutil.Equal(t, auth.DefaultAnonymousTTL, cleaner.ttl)
+}
+
+func TestAnonymousUserCleanupHandlerReturnsError(t *testing.T) {
+	cleaner := &fakeAnonymousUserCleaner{err: os.ErrClosed}
+	handler := jobs.AnonymousUserCleanupHandler(cleaner, testutil.DiscardLogger())
+
+	err := handler(context.Background(), nil)
+	testutil.Error(t, err)
+	testutil.Contains(t, err.Error(), "anonymous_user_cleanup")
+}
+
+func TestAnonymousUserCleanupHandlerNilCleaner(t *testing.T) {
+	handler := jobs.AnonymousUserCleanupHandler(nil, testutil.DiscardLogger())
+	err := handler(context.Background(), nil)
+	testutil.Error(t, err)
+	testutil.Contains(t, err.Error(), "cleaner is nil")
+}

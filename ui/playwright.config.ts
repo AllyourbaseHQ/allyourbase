@@ -1,0 +1,95 @@
+/**
+ * @module Playwright configuration for unmocked AYB dashboard browser tests.
+ */
+import { defineConfig } from "@playwright/test";
+
+// Environment-based configuration
+const ENV = process.env.PLAYWRIGHT_ENV || "local";
+const BLOCKED_PRODUCTION_ORIGIN = "https://install.allyourbase.io";
+const BASE_URLS = {
+  // WebAuthn requires the browser origin to match the RP origin AYB derives
+  // from server.PublicBaseURL(). The browser targets start AYB with
+  // --host 0.0.0.0 so the derived public origin normalizes to localhost.
+  local: "http://localhost:8090",
+  staging: "https://staging.allyourbase.io",
+};
+
+/**
+ * resolveBaseURL validates Playwright environment settings and blocks production targets.
+ */
+function resolveBaseURL(): string {
+  const configuredBaseURL =
+    process.env.PLAYWRIGHT_BASE_URL || BASE_URLS[ENV as keyof typeof BASE_URLS];
+
+  if (!configuredBaseURL) {
+    throw new Error(
+      `Unsupported PLAYWRIGHT_ENV '${ENV}'. Use one of: ${Object.keys(BASE_URLS).join(", ")} or set PLAYWRIGHT_BASE_URL explicitly.`,
+    );
+  }
+
+  let configuredOrigin: string;
+  try {
+    configuredOrigin = new URL(configuredBaseURL).origin;
+  } catch {
+    throw new Error(
+      `Invalid PLAYWRIGHT_BASE_URL '${configuredBaseURL}'. Provide an absolute http(s) URL.`,
+    );
+  }
+
+  if (configuredOrigin === BLOCKED_PRODUCTION_ORIGIN) {
+    throw new Error(
+      `Unmocked admin Playwright suites are blocked from targeting production (${BLOCKED_PRODUCTION_ORIGIN}). Use a non-production base URL.`,
+    );
+  }
+
+  return configuredBaseURL;
+}
+
+export default defineConfig({
+  testDir: "./browser-tests-unmocked",
+  globalSetup: "./browser-tests-unmocked/global-setup.ts",
+  outputDir: "test-results-unmocked",
+  timeout: 30_000, // Increased for network latency in staging/prod
+  expect: { timeout: 10_000 },
+  fullyParallel: true,
+  workers: 3, // Reduce parallelism to avoid resource contention
+  retries: 1, // Retry once on failure to handle timing issues
+  use: {
+    baseURL: resolveBaseURL(),
+    headless: true, // Always run in headless mode
+    trace: "retain-on-failure",
+    screenshot: "only-on-failure",
+    video: "retain-on-failure",
+  },
+  // Auth setup runs first, smoke and full depend on it
+  projects: [
+    {
+      name: "setup",
+      testMatch: /auth\.setup\.ts/,
+      use: { browserName: "chromium" },
+    },
+    {
+      name: "smoke",
+      testMatch: /smoke\/.*\.spec\.ts/,
+      dependencies: ["setup"],
+      use: {
+        browserName: "chromium",
+        storageState: "browser-tests-unmocked/.auth/admin.json",
+      },
+    },
+    {
+      name: "full",
+      testMatch: /full\/.*\.spec\.ts/,
+      dependencies: ["setup"],
+      use: {
+        browserName: "chromium",
+        storageState: "browser-tests-unmocked/.auth/admin.json",
+      },
+    },
+  ],
+  reporter: [
+    ["html", { outputFolder: "playwright-report", open: "never" }],
+    ["json", { outputFile: "playwright-report/results.json" }],
+    ["list"],
+  ],
+});
