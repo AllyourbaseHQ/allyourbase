@@ -1,0 +1,50 @@
+name: Installer Tests
+
+# Runs after a release completes, or manually.
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - "install.sh"
+      - "tests/test_install.sh"
+      - "tests/test_quickstart_e2e.sh"
+      - "tests/bash_assert_helpers.sh"
+      - ".github/workflows/test-installer.yml"
+  release:
+    types: [published]
+
+jobs:
+  installer:
+    # Skip if triggered by a failed release
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    name: Installer (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Go
+        if: github.event_name != 'release'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Run installer tests
+        run: sh tests/test_install.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build AYB for quickstart probe
+        if: github.event_name != 'release'
+        run: |
+          mkdir -p "$HOME/.ayb/bin"
+          go build -o "$HOME/.ayb/bin/ayb" ./cmd/ayb
+      - name: Install AYB for quickstart probe
+        if: github.event_name == 'release'
+        run: NO_MODIFY_PATH=1 sh install.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run quickstart e2e probe
+        timeout-minutes: 10
+        run: bash tests/test_quickstart_e2e.sh

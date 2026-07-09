@@ -1,0 +1,453 @@
+// Package jobs.
+package jobs
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// intervalSec formats a time.Duration as a Postgres-compatible interval string.
+// Go's Duration.String() produces "5m0s" which Postgres cannot parse;
+// this produces "300 seconds" which is unambiguous.
+func intervalSec(d time.Duration) string {
+	return fmt.Sprintf("%d seconds", int64(d.Seconds()))
+}
+
+// Store handles database operations for the job queue.
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+// NewStore creates a new job Store.
+func NewStore(pool *pgxpool.Pool) *Store {
+	return &Store{pool: pool}
+}
+
+const jobColumns = `id, type, payload, state, run_at, lease_until, worker_id,
+	attempts, max_attempts, last_error, last_run_at, idempotency_key,
+	schedule_id, created_at, updated_at, completed_at, canceled_at`
+
+func scanJob(row pgx.Row) (*Job, error) {
+	var j Job
+	err := row.Scan(
+		&j.ID, &j.Type, &j.Payload, &j.State, &j.RunAt, &j.LeaseUntil,
+		&j.WorkerID, &j.Attempts, &j.MaxAttempts, &j.LastError, &j.LastRunAt,
+		&j.IdempotencyKey, &j.ScheduleID, &j.CreatedAt, &j.UpdatedAt,
+		&j.CompletedAt, &j.CanceledAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &j, nil
+}
+
+// scanJobs scans all database result rows into a slice of Job structs, returning any error from the iteration.
+func scanJobs(rows pgx.Rows) ([]Job, error) {
+	var result []Job
+	for rows.Next() {
+		var j Job
+		if err := rows.Scan(
+			&j.ID, &j.Type, &j.Payload, &j.State, &j.RunAt, &j.LeaseUntil,
+			&j.WorkerID, &j.Attempts, &j.MaxAttempts, &j.LastError, &j.LastRunAt,
+			&j.IdempotencyKey, &j.ScheduleID, &j.CreatedAt, &j.UpdatedAt,
+			&j.CompletedAt, &j.CanceledAt,
+		); err != nil {
+			return nil, err
+		}
+		result = append(result, j)
+	}
+	return result, rows.Err()
+}
+
+func scanJobRuns(rows pgx.Rows) ([]JobRun, error) {
+	var result []JobRun
+	for rows.Next() {
+		var run JobRun
+		if err := rows.Scan(
+			&run.Attempt,
+			&run.Status,
+			&run.StartedAt,
+			&run.FinishedAt,
+			&run.DurationMs,
+			&run.Error,
+		); err != nil {
+			return nil, err
+		}
+		result = append(result, run)
+	}
+	return result, rows.Err()
+}
+
+// Enqueue inserts a new job with state=queued.
+func (s *Store) Enqueue(ctx context.Context, jobType string, payload json.RawMessage, opts EnqueueOpts) (*Job, error) {
+	if payload == nil {
+		payload = json.RawMessage("{}")
+	}
+	runAt := time.Now()
+	if opts.RunAt != nil {
+		runAt = *opts.RunAt
+	}
+	maxAttempts := 3
+	if opts.MaxAttempts > 0 {
+		maxAttempts = opts.MaxAttempts
+	}
+
+	var idempotencyKey *string
+	if opts.IdempotencyKey != "" {
+		idempotencyKey = &opts.IdempotencyKey
+	}
+	var scheduleID *string
+	if opts.ScheduleID != "" {
+		scheduleID = &opts.ScheduleID
+	}
+
+	row := s.pool.QueryRow(ctx,
+		`INSERT INTO _ayb_jobs (type, payload, run_at, max_attempts, idempotency_key, schedule_id)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 RETURNING `+jobColumns,
+		jobType, payload, runAt, maxAttempts, idempotencyKey, scheduleID,
+	)
+	return scanJob(row)
+}
+
+// Claim atomically claims the next eligible queued job using FOR UPDATE SKIP LOCKED.
+// Returns nil, nil if no job is available.
+func (s *Store) Claim(ctx context.Context, workerID string, leaseDuration time.Duration) (*Job, error) {
+	row := s.pool.QueryRow(ctx,
+		`UPDATE _ayb_jobs SET
+			state = 'running',
+			lease_until = NOW() + $1::interval,
+			worker_id = $2,
+			attempts = attempts + 1,
+			last_run_at = NOW(),
+			updated_at = NOW()
+		WHERE id = (
+			SELECT id FROM _ayb_jobs
+			WHERE state = 'queued' AND run_at <= NOW()
+			ORDER BY run_at
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING `+jobColumns,
+		intervalSec(leaseDuration), workerID,
+	)
+	j, err := scanJob(row)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return j, err
+}
+
+// mutateJobAndRecordRun executes the state mutation and inserts one run-history
+// row in a single transaction so terminal state and per-attempt history stay consistent.
+func (s *Store) mutateJobAndRecordRun(ctx context.Context, mutationSQL string, mutationArgs []any, runStatus string, runErr *string, timing RunTiming) (*Job, error) {
+	if timing.DurationMs < 0 {
+		timing.DurationMs = 0
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	row := tx.QueryRow(ctx, mutationSQL, mutationArgs...)
+	j, err := scanJob(row)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO _ayb_job_runs (job_id, attempt, status, started_at, finished_at, duration_ms, error)
+		 VALUES (
+			$1,
+			GREATEST(
+				$7,
+				COALESCE((SELECT MAX(attempt) + 1 FROM _ayb_job_runs WHERE job_id = $1), 1)
+			),
+			$2,
+			$3,
+			$4,
+			$5,
+			$6
+		)`,
+		j.ID, runStatus, timing.StartedAt, timing.FinishedAt, timing.DurationMs, runErr, j.Attempts,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return j, nil
+}
+
+// Complete marks a running job as completed.
+func (s *Store) Complete(ctx context.Context, jobID string, timing RunTiming) (*Job, error) {
+	j, err := s.mutateJobAndRecordRun(ctx,
+		`UPDATE _ayb_jobs SET
+			state = 'completed',
+			completed_at = NOW(),
+			lease_until = NULL,
+			worker_id = NULL,
+			updated_at = NOW()
+		WHERE id = $1 AND state = 'running'
+		RETURNING `+jobColumns,
+		[]any{jobID},
+		"completed",
+		nil,
+		timing,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("job %s not found or not in running state", jobID)
+	}
+	return j, err
+}
+
+// Fail handles a job failure. If retries remain, re-queues with backoff.
+// Otherwise marks as permanently failed.
+func (s *Store) Fail(ctx context.Context, jobID string, errMsg string, backoff time.Duration, timing RunTiming) (*Job, error) {
+	runErr := &errMsg
+
+	// First try re-queue (attempts < max_attempts).
+	j, err := s.mutateJobAndRecordRun(ctx,
+		`UPDATE _ayb_jobs SET
+			state = 'queued',
+			run_at = NOW() + $2::interval,
+			last_error = $3,
+			lease_until = NULL,
+			worker_id = NULL,
+			updated_at = NOW()
+		WHERE id = $1 AND state = 'running' AND attempts < max_attempts
+		RETURNING `+jobColumns,
+		[]any{jobID, intervalSec(backoff), errMsg},
+		"failed",
+		runErr,
+		timing,
+	)
+	if err == nil {
+		return j, nil
+	}
+	if err != pgx.ErrNoRows {
+		return nil, err
+	}
+
+	// Terminal failure: attempts >= max_attempts.
+	j, err = s.mutateJobAndRecordRun(ctx,
+		`UPDATE _ayb_jobs SET
+			state = 'failed',
+			last_error = $2,
+			lease_until = NULL,
+			worker_id = NULL,
+			updated_at = NOW()
+		WHERE id = $1 AND state = 'running'
+		RETURNING `+jobColumns,
+		[]any{jobID, errMsg},
+		"failed",
+		runErr,
+		timing,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("job %s not found or not in running state", jobID)
+	}
+	return j, err
+}
+
+// Cancel cancels a queued job.
+func (s *Store) Cancel(ctx context.Context, jobID string) (*Job, error) {
+	row := s.pool.QueryRow(ctx,
+		`UPDATE _ayb_jobs SET
+			state = 'canceled',
+			canceled_at = NOW(),
+			updated_at = NOW()
+		WHERE id = $1 AND state = 'queued'
+		RETURNING `+jobColumns,
+		jobID,
+	)
+	j, err := scanJob(row)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("job %s not found or not in queued state", jobID)
+	}
+	return j, err
+}
+
+// RetryNow resets a failed job to queued with run_at=now.
+func (s *Store) RetryNow(ctx context.Context, jobID string) (*Job, error) {
+	row := s.pool.QueryRow(ctx,
+		`UPDATE _ayb_jobs SET
+			state = 'queued',
+			run_at = NOW(),
+			last_error = NULL,
+			attempts = 0,
+			lease_until = NULL,
+			worker_id = NULL,
+			updated_at = NOW()
+		WHERE id = $1 AND state = 'failed'
+		RETURNING `+jobColumns,
+		jobID,
+	)
+	j, err := scanJob(row)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("job %s not found or not in failed state", jobID)
+	}
+	return j, err
+}
+
+// ExtendLease extends the lease of a running job by the given duration from now.
+// Returns an error if the job is not in the running state.
+func (s *Store) ExtendLease(ctx context.Context, jobID string, leaseDuration time.Duration) (*Job, error) {
+	row := s.pool.QueryRow(ctx,
+		`UPDATE _ayb_jobs SET
+			lease_until = NOW() + $2::interval,
+			updated_at = NOW()
+		WHERE id = $1 AND state = 'running'
+		RETURNING `+jobColumns,
+		jobID, intervalSec(leaseDuration),
+	)
+	j, err := scanJob(row)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("job %s not found or not in running state", jobID)
+	}
+	return j, err
+}
+
+// RecoverStalledJobs finds running jobs with expired leases and re-queues them.
+// Returns the number of recovered jobs.
+func (s *Store) RecoverStalledJobs(ctx context.Context) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE _ayb_jobs SET
+			state = 'queued',
+			lease_until = NULL,
+			worker_id = NULL,
+			updated_at = NOW()
+		WHERE state = 'running' AND lease_until < NOW()`,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// Get returns a job by ID.
+func (s *Store) Get(ctx context.Context, jobID string) (*Job, error) {
+	row := s.pool.QueryRow(ctx,
+		`SELECT `+jobColumns+` FROM _ayb_jobs WHERE id = $1`,
+		jobID,
+	)
+	j, err := scanJob(row)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("job %s not found", jobID)
+	}
+	return j, err
+}
+
+// List returns jobs with optional filters.
+func (s *Store) List(ctx context.Context, state string, jobType string, limit, offset int) ([]Job, error) {
+	query := `SELECT ` + jobColumns + ` FROM _ayb_jobs WHERE 1=1`
+	args := []any{}
+	argN := 1
+
+	if state != "" {
+		query += fmt.Sprintf(" AND state = $%d", argN)
+		args = append(args, state)
+		argN++
+	}
+	if jobType != "" {
+		query += fmt.Sprintf(" AND type = $%d", argN)
+		args = append(args, jobType)
+		argN++
+	}
+	query += " ORDER BY created_at DESC"
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT $%d", argN)
+		args = append(args, limit)
+		argN++
+	}
+	if offset > 0 {
+		query += fmt.Sprintf(" OFFSET $%d", argN)
+		args = append(args, offset)
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	jobs, err := scanJobs(rows)
+	if jobs == nil {
+		jobs = []Job{}
+	}
+	return jobs, err
+}
+
+// ListRuns returns persisted run-history rows for the job in attempt order.
+// It returns a deterministic not-found error only when the parent job row does not exist.
+func (s *Store) ListRuns(ctx context.Context, jobID string) ([]JobRun, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT attempt, status, started_at, finished_at, duration_ms, error
+		 FROM _ayb_job_runs
+		 WHERE job_id = $1
+		 ORDER BY attempt ASC`,
+		jobID,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	runs, err := scanJobRuns(rows)
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	if len(runs) > 0 {
+		return runs, nil
+	}
+
+	var exists bool
+	err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM _ayb_jobs WHERE id = $1)`, jobID).Scan(&exists)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, fmt.Errorf("job %s not found", jobID)
+	}
+
+	return []JobRun{}, nil
+}
+
+// Stats returns aggregate counts by state.
+func (s *Store) Stats(ctx context.Context) (*QueueStats, error) {
+	var stats QueueStats
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+			COALESCE(SUM(CASE WHEN state = 'queued' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN state = 'running' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN state = 'canceled' THEN 1 ELSE 0 END), 0)
+		FROM _ayb_jobs
+	`).Scan(&stats.Queued, &stats.Running, &stats.Completed, &stats.Failed, &stats.Canceled)
+	if err != nil {
+		return nil, err
+	}
+
+	// Oldest queued job age.
+	var age *float64
+	err = s.pool.QueryRow(ctx,
+		`SELECT EXTRACT(EPOCH FROM NOW() - MIN(run_at))
+		 FROM _ayb_jobs WHERE state = 'queued'`,
+	).Scan(&age)
+	if err != nil && err != pgx.ErrNoRows {
+		return nil, err
+	}
+	stats.OldestAge = age
+
+	return &stats, nil
+}

@@ -1,0 +1,36 @@
+{
+  "name": "ayb-kanban-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test:e2e": "playwright test",
+    "test:e2e:smoke": "playwright test --config playwright.smoke.config.ts tests/auth.spec.ts tests/seed.spec.ts tests/realtime.spec.ts --grep \"lands anonymous users in the board shell by default|fresh anonymous user lands on one seeded board with starter columns|board realtime transport connects via websocket\"",
+    "test:e2e:ui": "playwright test --ui",
+    "lint:e2e": "eslint tests/",
+    "lint:browser-tests": "npm run lint:e2e"
+  },
+  "dependencies": {
+    "@allyourbase/js": "file:../../sdk",
+    "@allyourbase/react": "file:../../sdk_react",
+    "@hello-pangea/dnd": "^17.0.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "autoprefixer": "^10.4.0",
+    "eslint": "^9.39.2",
+    "eslint-plugin-playwright": "^2.7.0",
+    "postcss": "^8.4.0",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.56.0",
+    "vite": "^5.4.0"
+  }
+}

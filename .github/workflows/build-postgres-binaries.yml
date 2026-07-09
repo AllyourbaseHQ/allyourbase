@@ -1,0 +1,170 @@
+name: Build Postgres Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      pg_version:
+        description: "Postgres major version to build"
+        required: false
+        default: "16"
+  push:
+    tags:
+      - "pg-[0-9]*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runs_on: ubuntu-latest
+            platform: linux-amd64
+            goos: linux
+            goarch: amd64
+          - runs_on: ubuntu-24.04-arm
+            platform: linux-arm64
+            goos: linux
+            goarch: arm64
+          - runs_on: macos-15-intel
+            platform: darwin-amd64
+            goos: darwin
+            goarch: amd64
+          - runs_on: macos-latest
+            platform: darwin-arm64
+            goos: darwin
+            goarch: arm64
+
+    runs-on: ${{ matrix.runs_on }}
+    name: Build (${{ matrix.platform }})
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set PG version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            candidate="${GITHUB_REF_NAME#pg-}"
+          else
+            candidate="${{ github.event.inputs.pg_version || '16' }}"
+          fi
+
+          # Keep workflow outputs and build paths bounded to numeric major versions.
+          if ! [[ "$candidate" =~ ^[0-9]+$ ]]; then
+            echo "Invalid pg_version input: $candidate" >&2
+            exit 1
+          fi
+
+          printf 'pg_version=%s\n' "$candidate" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc make curl xz-utils \
+            file \
+            libssl-dev libxml2-dev uuid-dev \
+            libreadline-dev zlib1g-dev
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl libxml2 readline xz
+
+      - name: Build Postgres binaries
+        run: |
+          bash scripts/build-postgres.sh \
+            --pg-version "${{ steps.version.outputs.pg_version }}" \
+            --os "${{ matrix.goos }}" \
+            --arch "${{ matrix.goarch }}" \
+            --output-dir dist/pg-binaries
+
+      - name: Verify built postgres architecture
+        run: |
+          binary_path="dist/pg-binaries/ayb-postgres-${{ steps.version.outputs.pg_version }}/bin/postgres"
+          if [ ! -f "$binary_path" ]; then
+            echo "Missing postgres binary at $binary_path"
+            exit 1
+          fi
+
+          file_output="$(file -b "$binary_path")"
+          detected_token="$(echo "$file_output" | awk '
+            /x86_64|x86-64/ {print "x86_64"; exit}
+            /aarch64/ {print "aarch64"; exit}
+            /arm64|arm64e/ {print "arm64"; exit}
+          ')"
+          if [ -z "$detected_token" ]; then
+            echo "Unable to map architecture token from: $file_output"
+            exit 1
+          fi
+
+          case "$detected_token" in
+            x86_64)
+              detected_goarch="amd64"
+              ;;
+            aarch64)
+              detected_goarch="arm64"
+              ;;
+            arm64)
+              detected_goarch="arm64"
+              ;;
+            *)
+              echo "Unsupported detected architecture token: $detected_token"
+              exit 1
+              ;;
+          esac
+
+          if [ "$detected_goarch" != "${{ matrix.goarch }}" ]; then
+            echo "Architecture mismatch: detected=$detected_goarch expected=${{ matrix.goarch }}"
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ayb-postgres-${{ steps.version.outputs.pg_version }}-${{ matrix.platform }}
+          path: |
+            dist/pg-binaries/ayb-postgres-*.tar.xz
+            dist/pg-binaries/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/pg-')
+    name: Create GitHub Release
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist/pg-binaries
+
+      - name: Set PG version from tag
+        id: version
+        run: echo "pg_version=${GITHUB_REF_NAME#pg-}" >> "$GITHUB_OUTPUT"
+
+      - name: Merge SHA256SUMS
+        run: |
+          cd dist/pg-binaries
+          find . -type f -name SHA256SUMS -print0 | xargs -0 cat | sort -u > SHA256SUMS_merged
+          mv SHA256SUMS_merged SHA256SUMS
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Postgres ${{ steps.version.outputs.pg_version }} Binaries"
+          body: |
+            AYB-managed Postgres ${{ steps.version.outputs.pg_version }} binaries with pgvector, pg_trgm, and pg_cron.
+
+            **Platforms:** linux-amd64, linux-arm64, darwin-amd64, darwin-arm64
+          files: |
+            dist/pg-binaries/**/ayb-postgres-*.tar.xz
+            dist/pg-binaries/SHA256SUMS

@@ -1,0 +1,476 @@
+// Package openapi.
+package openapi
+
+import (
+	"strings"
+
+	"github.com/allyourbase/ayb/internal/schema"
+)
+
+func collectionPathForTable(basePath, tableName string) string {
+	base := normalizeBasePath(basePath)
+	if base == "" {
+		// Backward-compatible default: table paths at root.
+		return "/" + tableName
+	}
+	return base + "/collections/" + tableName
+}
+
+func tableComponentName(tableName string, suffix string) string {
+	if len(tableName) == 0 {
+		return suffix
+	}
+	name := strings.ToUpper(tableName[0:1]) + tableName[1:]
+	if suffix != "" {
+		return name + suffix
+	}
+	return name
+}
+
+// buildTableCollectionPath creates GET (list) and POST (create) operations for a table.
+func buildTableCollectionPath(tbl *schema.Table, rowSchema, createSchema *schemaProperty, cache *schema.SchemaCache) *pathItem {
+	return &pathItem{
+		Get:  buildListOp(tbl, rowSchema, cache),
+		Post: buildInsertOp(tbl, createSchema, rowSchema),
+	}
+}
+
+// buildTableRecordPath creates GET (read), PATCH (update), and DELETE operations
+// for a single record addressed by primary key.
+func buildTableRecordPath(tbl *schema.Table, rowSchema, createSchema *schemaProperty) *pathItem {
+	return &pathItem{
+		Get:    buildReadOp(tbl, rowSchema),
+		Patch:  buildUpdateOp(tbl, createSchema, rowSchema),
+		Delete: buildDeleteOp(tbl),
+	}
+}
+
+func tableRowSchema(tbl *schema.Table, emitGeoJSONComponents bool) *schemaProperty {
+	props := make(map[string]*schemaProperty, len(tbl.Columns))
+	for _, col := range tbl.Columns {
+		props[col.Name] = columnToPropertyWithGeoJSONRefs(col, emitGeoJSONComponents)
+	}
+	return &schemaProperty{Type: "object", Properties: props}
+}
+
+func tableCreateSchema(tbl *schema.Table, emitGeoJSONComponents bool) *schemaProperty {
+	props := make(map[string]*schemaProperty, len(tbl.Columns))
+	for _, col := range tbl.Columns {
+		// Skip PK and columns with defaults for create schema.
+		if col.IsPrimaryKey {
+			continue
+		}
+		prop := columnToPropertyWithGeoJSONRefs(col, emitGeoJSONComponents)
+		prop.ReadOnly = false // writable in create
+		props[col.Name] = prop
+	}
+	return &schemaProperty{Type: "object", Properties: props}
+}
+
+func tableWriteSchema(tbl *schema.Table, emitGeoJSONComponents bool) *schemaProperty {
+	props := make(map[string]*schemaProperty, len(tbl.Columns))
+	for _, col := range tbl.Columns {
+		// Import and batch bodies can include any recognized table column.
+		prop := columnToPropertyWithGeoJSONRefs(col, emitGeoJSONComponents)
+		prop.ReadOnly = false
+		props[col.Name] = prop
+	}
+	return &schemaProperty{Type: "object", Properties: props}
+}
+
+// buildListOp creates an OpenAPI GET operation for listing rows in a table.
+func buildListOp(tbl *schema.Table, rowSchema *schemaProperty, cache *schema.SchemaCache) *operation {
+	return &operation{
+		Summary:     "List " + tbl.Name + " rows",
+		Tags:        []string{tbl.Name},
+		OperationID: "list_" + tbl.Name,
+		Parameters:  listQueryParams(tbl, cache),
+		Responses: map[string]*response{
+			"200": {
+				Description: "Successful response",
+				Content: map[string]*mediaContent{
+					"application/json": {
+						Schema: listResponseSchema(rowSchema),
+					},
+				},
+			},
+		},
+	}
+}
+
+func listResponseSchema(rowSchema *schemaProperty) *schemaProperty {
+	return &schemaProperty{
+		OneOf: []*schemaProperty{
+			offsetListResponseSchema(rowSchema),
+			cursorListResponseSchema(rowSchema),
+		},
+	}
+}
+
+func offsetListResponseSchema(rowSchema *schemaProperty) *schemaProperty {
+	return &schemaProperty{
+		Type:     "object",
+		Required: []string{"items", "page", "perPage", "totalItems", "totalPages"},
+		Properties: map[string]*schemaProperty{
+			"items": {
+				Type:        "array",
+				Description: "Rows for the current page",
+				Items:       listItemSchema(rowSchema),
+			},
+			"page": {
+				Type:        "integer",
+				Description: "Current page number",
+			},
+			"perPage": {
+				Type:        "integer",
+				Description: "Rows requested per page",
+			},
+			"totalItems": {
+				Type:        "integer",
+				Description: "Total matching rows, or -1 when skipTotal=true",
+			},
+			"totalPages": {
+				Type:        "integer",
+				Description: "Total pages, or -1 when skipTotal=true",
+			},
+			"facets": facetCountsSchema(),
+		},
+	}
+}
+
+func cursorListResponseSchema(rowSchema *schemaProperty) *schemaProperty {
+	return &schemaProperty{
+		Type:     "object",
+		Required: []string{"items", "perPage"},
+		Not:      &schemaProperty{Required: []string{"page"}},
+		Properties: map[string]*schemaProperty{
+			"items": {
+				Type:        "array",
+				Description: "Rows for the current cursor page",
+				Items:       listItemSchema(rowSchema),
+			},
+			"perPage": {
+				Type:        "integer",
+				Description: "Rows requested per page",
+			},
+			"nextCursor": {
+				Type:        "string",
+				Description: "Opaque cursor for the next page when more rows are available",
+			},
+			"facets": facetCountsSchema(),
+		},
+	}
+}
+
+func listItemSchema(rowSchema *schemaProperty) *schemaProperty {
+	return &schemaProperty{
+		AllOf: []*schemaProperty{
+			rowSchema,
+			{
+				Type: "object",
+				Properties: map[string]*schemaProperty{
+					"_highlight": {
+						Type:        "string",
+						Description: "HTML-highlighted search excerpt when highlight=true",
+					},
+				},
+			},
+		},
+	}
+}
+
+func facetCountsSchema() *schemaProperty {
+	return &schemaProperty{
+		Type:        "object",
+		Description: "Facet counts keyed by requested facet column",
+		AdditionalProperties: &schemaProperty{
+			Type: "array",
+			Items: &schemaProperty{
+				Type:     "object",
+				Required: []string{"value", "count"},
+				Properties: map[string]*schemaProperty{
+					"value": {
+						Description: "Facet value",
+					},
+					"count": {
+						Type:        "integer",
+						Description: "Number of matching rows for this facet value",
+					},
+				},
+			},
+		},
+	}
+}
+
+// buildReadOp creates an OpenAPI GET operation for reading a single record from a table.
+func buildReadOp(tbl *schema.Table, rowSchema *schemaProperty) *operation {
+	return &operation{
+		Summary:     "Read a single " + tbl.Name + " record",
+		Tags:        []string{tbl.Name},
+		OperationID: "read_" + tbl.Name,
+		Parameters:  []*parameter{idPathParam()},
+		Responses: map[string]*response{
+			"200": {
+				Description: "Successful response",
+				Content: map[string]*mediaContent{
+					"application/json": {Schema: rowSchema},
+				},
+			},
+		},
+	}
+}
+
+// buildInsertOp creates an OpenAPI POST operation for inserting rows into a table.
+func buildInsertOp(tbl *schema.Table, createSchema, rowSchema *schemaProperty) *operation {
+	return &operation{
+		Summary:     "Insert into " + tbl.Name,
+		Tags:        []string{tbl.Name},
+		OperationID: "insert_" + tbl.Name,
+		RequestBody: &requestBody{
+			Required: true,
+			Content: map[string]*mediaContent{
+				"application/json": {Schema: createSchema},
+			},
+		},
+		Responses: map[string]*response{
+			"201": {
+				Description: "Created",
+				Content: map[string]*mediaContent{
+					"application/json": {Schema: rowSchema},
+				},
+			},
+		},
+	}
+}
+
+// buildUpdateOp creates an OpenAPI PATCH operation for updating a record in a table.
+func buildUpdateOp(tbl *schema.Table, createSchema, rowSchema *schemaProperty) *operation {
+	return &operation{
+		Summary:     "Update a " + tbl.Name + " record",
+		Tags:        []string{tbl.Name},
+		OperationID: "update_" + tbl.Name,
+		Parameters:  []*parameter{idPathParam()},
+		RequestBody: &requestBody{
+			Required: true,
+			Content: map[string]*mediaContent{
+				"application/json": {Schema: createSchema},
+			},
+		},
+		Responses: map[string]*response{
+			"200": {
+				Description: "Updated",
+				Content: map[string]*mediaContent{
+					"application/json": {Schema: rowSchema},
+				},
+			},
+		},
+	}
+}
+
+func buildDeleteOp(tbl *schema.Table) *operation {
+	return &operation{
+		Summary:     "Delete a " + tbl.Name + " record",
+		Tags:        []string{tbl.Name},
+		OperationID: "delete_" + tbl.Name,
+		Parameters:  []*parameter{idPathParam()},
+		Responses: map[string]*response{
+			"204": {
+				Description: "Deleted",
+			},
+		},
+	}
+}
+
+// idPathParam returns the {id} path parameter for record-level operations.
+func idPathParam() *parameter {
+	return &parameter{
+		Name:        "id",
+		In:          "path",
+		Required:    true,
+		Description: "Record primary key",
+		Schema:      &schemaProperty{Type: "string"},
+	}
+}
+
+// listQueryParams produces the query parameters for GET list endpoints.
+// These match the actual AYB REST query engine in internal/api/handler.go.
+// The params are grouped into focused helpers (selection / pagination / search /
+// aggregation / spatial) to keep each function within the codehealth size
+// guardrail and to make the OpenAPI surface easier to scan by concern.
+func listQueryParams(tbl *schema.Table, cache *schema.SchemaCache) []*parameter {
+	params := selectionListQueryParams()
+	params = append(params, paginationListQueryParams()...)
+	params = append(params, searchListQueryParams()...)
+	params = append(params, aggregationListQueryParams(tbl, cache)...)
+	if cache != nil && cache.HasPostGIS && tbl != nil && tbl.HasGeometry() {
+		params = append(params, spatialListQueryParams()...)
+	}
+	return params
+}
+
+// selectionListQueryParams returns the column-selection / filtering / sorting params.
+func selectionListQueryParams() []*parameter {
+	return []*parameter{
+		{
+			Name:        "fields",
+			In:          "query",
+			Description: "Comma-separated list of columns to return",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+		{
+			Name:        "filter",
+			In:          "query",
+			Description: "Filter expression (e.g. status='active' && age>25). Operators: =, !=, >, >=, <, <=, ~ (LIKE), !~ (NOT LIKE), IN, IS NULL. Combine with && (AND) or || (OR). Parentheses supported.",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+		{
+			Name:        "sort",
+			In:          "query",
+			Description: "Sort expression: column name with optional - prefix for descending (comma-separated for multiple)",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+	}
+}
+
+// paginationListQueryParams returns the offset + cursor pagination params.
+func paginationListQueryParams() []*parameter {
+	return []*parameter{
+		{
+			Name:        "page",
+			In:          "query",
+			Description: "Page number (1-indexed, default 1)",
+			Schema:      &schemaProperty{Type: "integer"},
+		},
+		{
+			Name:        "perPage",
+			In:          "query",
+			Description: "Number of rows per page (default 20, max 500)",
+			Schema:      &schemaProperty{Type: "integer"},
+		},
+		{
+			Name:        "skipTotal",
+			In:          "query",
+			Description: "Set to 'true' to skip total count for faster pagination",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+		{
+			Name:        "cursor",
+			In:          "query",
+			Description: "Opaque cursor for pagination (use nextCursor from previous response)",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+		{
+			Name:        "direction",
+			In:          "query",
+			Description: "Pagination direction: 'forward' or 'backward' (default forward)",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+	}
+}
+
+// searchListQueryParams returns the full-text / fuzzy / facet / semantic search params.
+func searchListQueryParams() []*parameter {
+	minTypoThreshold := 0.0
+	maxTypoThreshold := 1.0
+	return []*parameter{
+		{
+			Name:        "search",
+			In:          "query",
+			Description: "Full-text search term across text columns",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+		{
+			Name:        "fuzzy",
+			In:          "query",
+			Description: "Set to true to include fuzzy trigram search matches",
+			Schema:      &schemaProperty{Type: "boolean"},
+		},
+		{
+			Name:        "typo_threshold",
+			In:          "query",
+			Description: "Similarity threshold for fuzzy search matches",
+			Schema:      &schemaProperty{Type: "number", Minimum: &minTypoThreshold, Maximum: &maxTypoThreshold},
+		},
+		{
+			Name:        "highlight",
+			In:          "query",
+			Description: "Set to true to include _highlight excerpts on search results",
+			Schema:      &schemaProperty{Type: "boolean"},
+		},
+		{
+			Name:        "facets",
+			In:          "query",
+			Description: "Comma-separated list of columns to return facet counts for",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+		{
+			Name:        "semantic",
+			In:          "query",
+			Description: "Set to true to run semantic search from the search query",
+			Schema:      &schemaProperty{Type: "boolean"},
+		},
+		{
+			Name:        "semantic_query",
+			In:          "query",
+			Description: "Semantic search query text",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+	}
+}
+
+// aggregationListQueryParams returns the aggregate / group params (description is table-aware).
+func aggregationListQueryParams(tbl *schema.Table, cache *schema.SchemaCache) []*parameter {
+	return []*parameter{
+		{
+			Name:        "aggregate",
+			In:          "query",
+			Description: aggregateParamDescription(tbl, cache),
+			Schema:      &schemaProperty{Type: "string"},
+		},
+		{
+			Name:        "group",
+			In:          "query",
+			Description: "Group by column(s) (comma-separated)",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+	}
+}
+
+// spatialListQueryParams returns the PostGIS spatial filter params. Only appended
+// when the schema has PostGIS and the table has a geometry column.
+func spatialListQueryParams() []*parameter {
+	return []*parameter{
+		{
+			Name:        "near",
+			In:          "query",
+			Description: "Spatial near filter format: column,lng,lat,distance (example: location,-73.9857,40.7484,1000)",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+		{
+			Name:        "within",
+			In:          "query",
+			Description: "Spatial within filter format: column,{geojson} (example: location,{\"type\":\"Polygon\",\"coordinates\":[[[-74,40],[-73,40],[-73,41],[-74,40]]]})",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+		{
+			Name:        "intersects",
+			In:          "query",
+			Description: "Spatial intersects filter format: column,{geojson} (example: location,{\"type\":\"LineString\",\"coordinates\":[[-74,40],[-73,41]]})",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+		{
+			Name:        "bbox",
+			In:          "query",
+			Description: "Spatial bounding box filter format: column,minLng,minLat,maxLng,maxLat (example: location,-74,40,-73,41)",
+			Schema:      &schemaProperty{Type: "string"},
+		},
+	}
+}
+
+func aggregateParamDescription(tbl *schema.Table, cache *schema.SchemaCache) string {
+	description := "Aggregation expression (e.g. count(*), sum(amount), avg(price))"
+	if cache != nil && cache.HasPostGIS && tbl != nil && tbl.HasGeometry() {
+		return description + "; spatial examples: bbox(column), centroid(column)"
+	}
+	return description
+}
