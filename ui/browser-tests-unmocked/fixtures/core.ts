@@ -1,3 +1,6 @@
+/**
+ * @module ui/browser-tests-unmocked/fixtures/core.ts
+ */
 import { expect, type APIRequestContext, type Page } from "@playwright/test";
 
 export function sqlLiteral(value: string): string {
@@ -42,6 +45,7 @@ export async function execSQL(
   request: APIRequestContext,
   token: string,
   query: string,
+  options: { tenantID?: string } = {},
 ): Promise<{ columns: string[]; rows: unknown[][]; rowCount: number }> {
   const statements = query
     .split(";")
@@ -55,8 +59,12 @@ export async function execSQL(
   };
 
   for (const statement of statements) {
+    const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+    if (options.tenantID) {
+      headers["X-Tenant-ID"] = options.tenantID;
+    }
     const res = await request.post("/api/admin/sql", {
-      headers: { Authorization: `Bearer ${token}` },
+      headers,
       data: { query: statement },
     });
     await validateResponse(res, `Execute SQL: ${statement.substring(0, 50)}...`);
@@ -64,32 +72,6 @@ export async function execSQL(
   }
 
   return lastResult;
-}
-
-export async function waitForCollectionAvailable(
-  request: APIRequestContext,
-  token: string,
-  tableName: string,
-  timeoutMs = 10_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  let lastStatus = 0;
-  let lastBody = "";
-
-  while (Date.now() <= deadline) {
-    const res = await request.get(`/api/collections/${encodeURIComponent(tableName)}?perPage=1`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (res.ok()) {
-      return;
-    }
-    lastStatus = res.status();
-    lastBody = await res.text().catch(() => "");
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
-
-  const suffix = lastBody.length > 0 ? `: ${lastBody}` : "";
-  throw new Error(`Timed out waiting for collection ${tableName} (last status ${lastStatus}${suffix})`);
 }
 
 export async function probeEndpoint(

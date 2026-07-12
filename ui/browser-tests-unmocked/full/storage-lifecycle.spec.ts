@@ -4,18 +4,11 @@ import {
   probeEndpoint,
   seedFile,
   deleteFile,
+  ensureStorageBucket,
   execSQL,
   sqlLiteral,
   waitForDashboard,
 } from "../fixtures";
-
-function storageBucketCleanupSQL(bucket: string): string {
-  return `DELETE FROM _ayb_storage_buckets WHERE tenant_id = '' AND name = '${sqlLiteral(bucket)}'`;
-}
-
-function storageBucketSeedSQL(bucket: string): string {
-  return `INSERT INTO _ayb_storage_buckets (tenant_id, name, public) VALUES ('', '${sqlLiteral(bucket)}', true) ON CONFLICT (tenant_id, name) DO NOTHING`;
-}
 
 /**
  * FULL E2E TEST: Storage Lifecycle
@@ -44,7 +37,7 @@ test.describe("Storage Lifecycle (Full E2E)", () => {
       await execSQL(
         request,
         adminToken,
-        storageBucketCleanupSQL(bucket),
+        `DELETE FROM _ayb_storage_buckets WHERE tenant_id = '' AND name = '${sqlLiteral(bucket)}'`,
       ).catch(() => {});
     }
     pendingBucketCleanup.length = 0;
@@ -65,12 +58,7 @@ test.describe("Storage Lifecycle (Full E2E)", () => {
     // Register cleanup early so afterEach runs it even on failure
     pendingFileCleanup.push({ bucket: bucketName, name: fileName });
 
-    // Create a dedicated bucket for this run.
-    await execSQL(
-      request,
-      adminToken,
-      storageBucketSeedSQL(bucketName),
-    );
+    await ensureStorageBucket(request, adminToken, bucketName);
 
     // Arrange: seed a file via API
     await seedFile(request, adminToken, bucketName, fileName, "lifecycle verify content");
@@ -109,12 +97,7 @@ test.describe("Storage Lifecycle (Full E2E)", () => {
       { bucket: bucketName, name: imgFileName },
     );
 
-    // Create a dedicated bucket for this run.
-    await execSQL(
-      request,
-      adminToken,
-      storageBucketSeedSQL(bucketName),
-    );
+    await ensureStorageBucket(request, adminToken, bucketName);
 
     // ============================================================
     // Setup: Navigate to Storage

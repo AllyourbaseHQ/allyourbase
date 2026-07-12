@@ -1,3 +1,6 @@
+/**
+ * @module ui/browser-tests-unmocked/fixtures/realtime.ts
+ */
 import type { Page } from "@playwright/test";
 
 const REALTIME_WS_PATH = "/api/realtime/ws";
@@ -10,6 +13,45 @@ export interface SSECaptureHandle {
 interface SSEFrame {
   data: string;
   event: string;
+}
+
+interface RealtimeSSEOpenResult {
+  body: ReadableStream<Uint8Array>;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function openRealtimeSSE(
+  endpoint: URL,
+  token: string,
+  signal: AbortSignal,
+): Promise<RealtimeSSEOpenResult> {
+  let lastError = "";
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const response = await fetch(endpoint, {
+      headers: {
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${token}`,
+      },
+      signal,
+    });
+    if (response.ok) {
+      if (!response.body) {
+        throw new Error("Realtime SSE response body was empty");
+      }
+      return { body: response.body };
+    }
+
+    lastError = await response.text().catch(() => "");
+    if (response.status !== 400 || !lastError.includes("unknown table")) {
+      throw new Error(`Realtime SSE request failed with status ${response.status}: ${lastError}`);
+    }
+    await delay(250);
+  }
+
+  throw new Error(`Realtime SSE request failed while waiting for schema cache: ${lastError}`);
 }
 
 function emitSSEFrame(
@@ -114,23 +156,9 @@ export async function startSSECapture(
   }, 10_000);
 
   const streamTask = (async () => {
-    const response = await fetch(endpoint, {
-      headers: {
-        Accept: "text/event-stream",
-        Authorization: `Bearer ${token}`,
-      },
-      signal: abortController.signal,
-    });
-    if (!response.ok) {
-      const detail = await response.text().catch(() => "");
-      const suffix = detail ? `: ${detail}` : "";
-      throw new Error(`Realtime SSE request failed with status ${response.status}${suffix}`);
-    }
-    if (!response.body) {
-      throw new Error("Realtime SSE response body was empty");
-    }
+    const { body: responseBody } = await openRealtimeSSE(endpoint, token, abortController.signal);
 
-    await consumeSSEStream(response.body, ({ event, data }) => {
+    await consumeSSEStream(responseBody, ({ event, data }) => {
       if (event === "connected") {
         if (!connected) {
           connected = true;
@@ -158,7 +186,6 @@ export async function startSSECapture(
     clearTimeout(timeoutHandle);
     if (!connected && !abortController.signal.aborted) {
       rejectConnected?.(error instanceof Error ? error : new Error(String(error)));
-      return;
     }
     if (abortController.signal.aborted) {
       return;
@@ -315,6 +342,7 @@ export async function createApiKeyForUser(
   userId: string,
   keyName: string,
   scope: string = "*",
+  allowedTables: string[] = [],
 ): Promise<{ key: string }> {
   const requestBody = {
     headers: {
@@ -325,6 +353,7 @@ export async function createApiKeyForUser(
       userId,
       name: keyName,
       scope,
+      allowedTables,
     },
   };
   let res = await request.post("/api/admin/api-keys", requestBody);

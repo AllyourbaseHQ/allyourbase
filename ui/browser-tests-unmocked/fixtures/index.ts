@@ -1,3 +1,6 @@
+/**
+ * @module ui/browser-tests-unmocked/fixtures/index.ts
+ */
 import { expect, test as base, type APIRequestContext, type Page, type TestInfo } from "@playwright/test";
 import { getBrowserUnmockedSkipReason } from "../browser-preflight";
 import { checkAuthEnabled, execSQL, getStoredAdminToken, waitForDashboard } from "./core";
@@ -15,6 +18,7 @@ export * from "./oauth";
 export * from "./sms";
 export * from "./push";
 export * from "./admin";
+export * from "./search_admin";
 export * from "./jobs";
 export * from "./infra";
 export * from "./sites";
@@ -57,9 +61,7 @@ export async function createTableViaSQLEditor(page: Page, tableName: string): Pr
   await waitForDashboard(page);
 
   const sidebar = page.getByRole("complementary");
-  const sqlEditorButton = sidebar.getByRole("button", {
-    name: /^SQL Editor$/i,
-  });
+  const sqlEditorButton = sidebar.getByRole("button", { name: "SQL Editor", exact: true });
   await expect(sqlEditorButton).toBeVisible();
   await sqlEditorButton.click();
 
@@ -72,13 +74,9 @@ export async function createTableViaSQLEditor(page: Page, tableName: string): Pr
   await expect(page.getByText(/Statement executed successfully/i)).toBeVisible({
     timeout: 5000,
   });
-  const tableNavItem = sidebar.getByText(safeTableName, { exact: true });
-  await expect(tableNavItem)
-    .toBeVisible({ timeout: 5000 })
-    .catch(async () => {
-      await sidebar.getByRole("button", { name: "Refresh schema" }).click();
-      await expect(tableNavItem).toBeVisible({ timeout: 10000 });
-    });
+  await expect(sidebar.getByText(safeTableName, { exact: true })).toBeVisible({
+    timeout: 10000,
+  });
 }
 
 export const test = base.extend<{
