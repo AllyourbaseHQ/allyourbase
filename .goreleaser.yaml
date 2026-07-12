@@ -49,7 +49,7 @@ release:
     owner: AllyourbaseHQ
     name: allyourbase
   draft: false
-  prerelease: "{{ contains .Tag \"-\" }}"
+  prerelease: auto
 
 scoops:
   - repository:
