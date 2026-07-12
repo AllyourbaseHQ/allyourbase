@@ -1,6 +1,3 @@
-/**
- * @module ui/browser-tests-unmocked/fixtures/index.ts
- */
 import { expect, test as base, type APIRequestContext, type Page, type TestInfo } from "@playwright/test";
 import { getBrowserUnmockedSkipReason } from "../browser-preflight";
 import { checkAuthEnabled, execSQL, getStoredAdminToken, waitForDashboard } from "./core";
@@ -61,7 +58,7 @@ export async function createTableViaSQLEditor(page: Page, tableName: string): Pr
 
   const sidebar = page.getByRole("complementary");
   const sqlEditorButton = sidebar.getByRole("button", {
-    name: /^SQL Editor$|^Open SQL Editor$/i,
+    name: /^SQL Editor$/i,
   });
   await expect(sqlEditorButton).toBeVisible();
   await sqlEditorButton.click();
@@ -75,9 +72,13 @@ export async function createTableViaSQLEditor(page: Page, tableName: string): Pr
   await expect(page.getByText(/Statement executed successfully/i)).toBeVisible({
     timeout: 5000,
   });
-  await expect(sidebar.getByText(safeTableName, { exact: true })).toBeVisible({
-    timeout: 10000,
-  });
+  const tableNavItem = sidebar.getByText(safeTableName, { exact: true });
+  await expect(tableNavItem)
+    .toBeVisible({ timeout: 5000 })
+    .catch(async () => {
+      await sidebar.getByRole("button", { name: "Refresh schema" }).click();
+      await expect(tableNavItem).toBeVisible({ timeout: 10000 });
+    });
 }
 
 export const test = base.extend<{
