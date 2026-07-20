@@ -1,10 +1,11 @@
-.PHONY: build dev test test-sdk test-sdk-go test-sdk-python test-sdk-dart test-sdk-swift test-sdk-kotlin test-sdk-react test-sdk-ssr test-sdk-all test-sdk-integration test-ui test-quickstart-contract test-integration test-multinode test-cell test-demo-smoke test-demo-e2e test-demo-launch test-demo-cross-smoke test-e2e test-smoke test-browser-full test-full test-all test-everything test-api-smoke test-api-journey lint check hygiene check-hygiene check-sizes check-screen-specs check-followups check-ui-bundle-size check-ui-lint check-browser-tests-lint check-func-sizes check-installer check-sdk-build launch-check adoption release-candidate-check clean ui demos release docker docker-runtime-smoke help sync-openapi build-postgres load-admin-status load-admin-status-local load-auth-request-path load-auth-request-path-local load-data-path load-data-path-local load-data-pool-pressure load-data-pool-pressure-local load-http-100 load-http-100-local load-http-500 load-http-500-local load-http-1000 load-http-1000-local load-realtime-ws load-realtime-ws-local load-realtime-ws-1000 load-realtime-ws-1000-local load-realtime-ws-5000 load-realtime-ws-5000-local load-realtime-ws-10000 load-realtime-ws-10000-local load-sustained-soak load-sustained-soak-local
+.PHONY: build dev test test-sdk test-sdk-go test-sdk-python test-sdk-dart test-sdk-swift test-sdk-kotlin test-sdk-react test-sdk-ssr test-sdk-all test-sdk-integration test-ui test-demos-unit test-quickstart-contract test-integration test-multinode test-cell test-demo-smoke test-demo-instantsearch test-demo-e2e test-demo-launch test-demo-cross-smoke test-demo-movies-real-provider test-e2e test-smoke test-browser-full test-full test-all test-everything test-api-smoke test-api-journey lint check hygiene check-hygiene check-sizes check-screen-specs check-coverage-matrix check-followups check-ui-bundle-size check-ui-lint check-browser-tests-lint check-func-sizes check-installer check-sdk-build launch-check adoption release-candidate-check clean ui demos release docker docker-runtime-smoke help sync-openapi build-postgres load-admin-status load-admin-status-local load-auth-request-path load-auth-request-path-local load-data-path load-data-path-local load-data-pool-pressure load-data-pool-pressure-local load-http-100 load-http-100-local load-http-500 load-http-500-local load-http-1000 load-http-1000-local load-realtime-ws load-realtime-ws-local load-realtime-ws-1000 load-realtime-ws-1000-local load-realtime-ws-5000 load-realtime-ws-5000-local load-realtime-ws-10000 load-realtime-ws-10000-local load-sustained-soak load-sustained-soak-local
 
 # Build variables
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 DATE    ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS  = -ldflags "-s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)"
+PNPM    ?= $(shell if command -v pnpm >/dev/null 2>&1; then printf 'pnpm'; elif command -v corepack >/dev/null 2>&1; then printf 'corepack pnpm'; else printf 'pnpm'; fi)
 
 LOAD_K6_BIN ?= k6
 LOAD_DEFAULT_VUS ?= 1
@@ -136,7 +137,7 @@ sdk/dist/.stamp: $(shell find sdk/src -type f) sdk/package.json sdk/package-lock
 	@touch $@
 
 sdk_react/dist/.stamp: $(shell find sdk_react/src -type f) sdk_react/package.json sdk_react/pnpm-lock.yaml sdk_react/tsconfig.json sdk/dist/.stamp
-	cd sdk_react && pnpm install && pnpm run build
+	cd sdk_react && $(PNPM) install && $(PNPM) run build
 	@touch $@
 
 examples/kanban/dist/.stamp: $(KANBAN_DEPS) sdk/dist/.stamp sdk_react/dist/.stamp
@@ -152,7 +153,7 @@ examples/movies/dist/.stamp: $(MOVIES_DEPS) sdk/dist/.stamp sdk_react/dist/.stam
 	@touch $@
 
 ui/dist/.stamp: $(UI_DEPS)
-	cd ui && pnpm install && pnpm build
+	cd ui && $(PNPM) install && $(PNPM) build
 	@touch $@
 
 build: ui/dist/.stamp examples/kanban/dist/.stamp examples/live-polls/dist/.stamp examples/movies/dist/.stamp ## Build the ayb binary (rebuilds UI + demos if sources changed)
@@ -186,10 +187,10 @@ test-sdk-kotlin: ## Run Kotlin SDK tests (requires JDK)
 	cd sdk_kotlin && ./gradlew test
 
 test-sdk-react: ## Run React SDK checks (requires JS SDK deps for relative source imports)
-	cd sdk && npm ci && cd ../sdk_react && pnpm install && pnpm test
+	cd sdk && npm ci && cd ../sdk_react && $(PNPM) install && $(PNPM) test
 
 test-sdk-ssr: ## Run SSR SDK checks (requires JS SDK deps for relative source imports)
-	cd sdk && npm ci && cd ../sdk_ssr && pnpm install && pnpm test
+	cd sdk && npm ci && cd ../sdk_ssr && $(PNPM) install && $(PNPM) test
 
 test-sdk-all: ## Run all locally-runnable SDK checks (excludes Kotlin)
 	$(MAKE) test-sdk
@@ -201,7 +202,12 @@ test-sdk-all: ## Run all locally-runnable SDK checks (excludes Kotlin)
 	$(MAKE) test-sdk-ssr
 
 test-ui: ## Run UI component tests (vitest + jsdom, no browser)
-	cd ui && pnpm install --frozen-lockfile && pnpm test
+	cd ui && $(PNPM) install --frozen-lockfile && $(PNPM) test
+
+test-demos-unit: sdk/dist/.stamp sdk_react/dist/.stamp ## Run Vitest-only demo unit suites
+	cd examples/live-polls && npm ci --prefer-offline --no-audit && npm test
+	cd examples/movies && npm ci --prefer-offline --no-audit && npm test
+	cd examples/instantsearch_demo && npm ci --prefer-offline --no-audit && npm test
 
 test-quickstart-contract: check-installer ## Run installer, documented-command coverage, and live first-run contracts
 	bash tests/test_extract_doc_block.sh
@@ -219,6 +225,9 @@ test-cell: ## LB-routed cell topology E2E: compose PG + MinIO + ayb1/ayb2 + ngin
 
 test-demo-smoke: ## Run demo smoke tests only — schema apply, tables, RLS, CRUD (needs managed Postgres)
 	go run ./internal/testutil/cmd/testpg -- go tool gotestsum --format testdox -- -tags=integration -count=1 -run TestDemoSmoke ./internal/e2e/
+
+test-demo-instantsearch: ## Run InstantSearch demo unit/build/lint/node/browser tests against a live runtime
+	@bash -lc 'set -euo pipefail; source tests/port_helpers.sh; AYB_API_PORT="$$(pick_free_port 48093 49093 50093 51093 52093)" || { echo "No free isolated AYB API port available for InstantSearch demo" >&2; exit 1; }; export AYB_API_PORT; AYB_APP_PORT="$$(pick_free_port 45196 46196 47196 48196 49196)" || { echo "No free isolated app port available for InstantSearch demo" >&2; exit 1; }; export AYB_APP_PORT; AYB_DATABASE_EMBEDDED_PORT="$$(pick_free_port 45435 46435 47435 48435 49435)" || { echo "No free isolated embedded Postgres port available for InstantSearch demo" >&2; exit 1; }; export AYB_DATABASE_EMBEDDED_PORT; cd examples/instantsearch_demo; npm test; npm run build; npm run lint:browser-tests; npm run test:node-probe; browser_status=0; npm run test:browser-tests || browser_status=$$?; cd ../..; guard_status=0; bash scripts/check-playwright-executed.sh examples/instantsearch_demo/playwright-report/results.json instantsearch_demo || guard_status=$$?; test "$$browser_status" -eq 0 && test "$$guard_status" -eq 0'
 
 test-smoke: build ## Run Playwright smoke tests — 8 critical paths, ~5 min (builds + starts server)
 	@bash -lc '$(BROWSER_EXPORT_AUTH_ENV); export AYB_START_COMMAND="$${AYB_START_COMMAND:-$(BROWSER_LOCAL_AYB_START_COMMAND)}"; bash scripts/run-with-ayb.sh "cd ui && npm run test:browser -- --project=smoke"'
@@ -322,13 +331,19 @@ load-sustained-soak: ## Run direct k6 sustained mixed-workload soak scenario aga
 load-sustained-soak-local: ## Start local AYB with run-with-ayb and run the sustained mixed-workload soak scenario
 	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); export -f load_base_url_is_loopback load_exchange_admin_password_for_token load_resolve_admin_token; load_export_env; load_export_auth_env; load_export_admin_password_env; bash scripts/run-with-ayb.sh "load_resolve_admin_token && $(LOAD_SUSTAINED_SOAK_K6_COMMAND)"'
 
-test-all: test test-integration test-sdk test-ui ## Run all fast tests: Go unit + integration + SDK + UI components
+test-all: test test-integration test-sdk test-ui test-demos-unit ## Run all fast tests: Go unit + integration + SDK + UI + demo units
 
 test-full: test-all test-e2e ## Run every automated test: unit + integration + SDK + UI + all browser tests (~1.5 hrs)
 
 # Full per-demo Playwright suites, including live-polls passkey coverage.
 test-demo-e2e: build ## Run demo app E2E tests — Playwright suites for kanban + live-polls + movies (starts demo, runs tests, stops)
 	@cd _dev/manual_smoke_tests && AYB_BIN=$(CURDIR)/ayb bash 18_demo_e2e.test.sh
+
+# Deliberately excluded from test-all/test-full: this lane pulls the multi-hundred-MB
+# nomic-embed-text model and needs exclusive use of the fixed Ollama port 11434, so it
+# runs as its own CI job and its own local command rather than in the fast lane.
+test-demo-movies-real-provider: build ## Run movies real-provider smoke — real Ollama embeddings end to end (needs ollama + free port 11434)
+	@AYB_BIN=$(CURDIR)/ayb bash _dev/manual_smoke_tests/19_movies_real_provider.test.sh
 
 test-demo-launch: build ## Run demo launch smoke — kanban + live-polls + movies CLI launch contracts
 	@cd _dev/manual_smoke_tests && AYB_BIN=$(CURDIR)/ayb bash 17_demo_launch.test.sh
@@ -381,6 +396,9 @@ check-sizes: ## Run source-size guardrail
 check-screen-specs: ## Run screen-spec format guard
 	bash scripts/check_screen_spec.sh docs/reference/screen_specs
 
+check-coverage-matrix: ## Run browser coverage matrix guard
+	bash scripts/check-coverage-matrix.sh
+
 check-followups: ## Report follow-up ledger pollution without blocking aggregate gates
 	@status=0; \
 	if ! git show HEAD:chats/icg/_followups.md | bash scripts/check_followups.sh HEAD=-; then status=1; fi; \
@@ -399,15 +417,19 @@ hygiene: ## Strip leaked worktree paths and run hygiene guard
 	$(MAKE) check-hygiene
 
 check-ui-lint: ## Lint admin UI TypeScript source
-	cd ui && pnpm install --frozen-lockfile && npx eslint src/
+	cd ui && $(PNPM) install --frozen-lockfile && npx eslint src/
 
 check-browser-tests-lint: ## Lint browser test specs
-	cd ui && npm run lint:browser-tests && npm run lint:browser-tests:mocked
+	cd ui && $(PNPM) install --frozen-lockfile && npm run lint:browser-tests && npm run lint:browser-tests:mocked
+	cd examples/kanban && npm ci --prefer-offline --no-audit && npm run lint:browser-tests
+	cd examples/live-polls && npm ci --prefer-offline --no-audit && npm run lint:browser-tests
+	cd examples/movies && npm ci --prefer-offline --no-audit && npm run lint:browser-tests
+	cd examples/instantsearch_demo && npm ci --prefer-offline --no-audit && npm run lint:browser-tests
 
 check-func-sizes: ## Run Go function-size guardrail test
 	go test ./internal/codehealth -run TestFunctionSizeAllowlist -count=1
 
-check: hygiene fmt lint check-sizes check-screen-specs check-ui-bundle-size check-ui-lint check-func-sizes ## Run local CI-equivalent quality checks
+check: hygiene fmt lint check-sizes check-screen-specs check-coverage-matrix check-ui-bundle-size check-ui-lint check-func-sizes ## Run local CI-equivalent quality checks
 
 check-installer: ## Run installer validation suite
 	sh tests/test_install.sh
@@ -424,7 +446,7 @@ check-sdk-build: ## Build the JavaScript SDK
 release-candidate-check: check check-browser-tests-lint test-all test-multinode test-sdk-integration test-cell test-quickstart-contract ui check-sdk-build check-installer test-demo-launch test-demo-e2e test-smoke test-browser-full ## Run the trusted public release candidate gate
 
 ui: ## Build the admin dashboard SPA
-	cd ui && pnpm install && pnpm build
+	cd ui && $(PNPM) install && $(PNPM) build
 
 demos: ## Build demo apps (force rebuild, pre-built for go:embed)
 	rm -f examples/kanban/dist/.stamp examples/live-polls/dist/.stamp examples/movies/dist/.stamp
